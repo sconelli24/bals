@@ -262,6 +262,7 @@ fn run_av_clip_test(
         out_w,
         out_h,
         video_config.fps.as_u32(),
+        true,
     )?;
     let mut encoder = H264Encoder::new(&d3d, video_config)?;
 

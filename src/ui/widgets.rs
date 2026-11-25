@@ -255,6 +255,7 @@ pub enum SectionIcon {
     Video,
     Audio,
     Capture,
+    Camera,
     System,
     Clips,
     Deck,
@@ -342,6 +343,26 @@ pub fn draw_section_icon(painter: &egui::Painter, rect: Rect, p: &RetroPalette, 
                 stroke,
             );
         }
+        SectionIcon::Camera => {
+            // Webcam retro circular con lente central, LED y soporte base
+            let lens_center = pos2(r.center().x, r.center().y - 1.2);
+            painter.circle_stroke(lens_center, 4.6, stroke);
+            painter.circle_filled(lens_center, 1.8, p.amber);
+            painter.line_segment(
+                [
+                    pos2(r.center().x - 3.6, r.bottom() - 0.8),
+                    pos2(r.center().x + 3.6, r.bottom() - 0.8),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    pos2(r.center().x, lens_center.y + 4.4),
+                    pos2(r.center().x, r.bottom() - 0.8),
+                ],
+                stroke,
+            );
+        }
         SectionIcon::System => {
             // Sliders / panel de ajustes retro (3 carriles con perillas)
             let ys = [r.top() + 2.5, r.center().y, r.bottom() - 2.5];
@@ -394,6 +415,30 @@ pub fn retro_card(
     right_badge: Option<&str>,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
+    retro_card_custom_header(
+        ui,
+        p,
+        icon,
+        title,
+        |ui| {
+            if let Some(badge) = right_badge {
+                ui.label(egui::RichText::new(badge).size(11.0).color(p.amber));
+            }
+        },
+        add_contents,
+    );
+}
+
+/// Variante de `retro_card` que permite colocar controles interactivos (p. ej. píldora clickeable)
+/// en el extremo derecho del encabezado de la tarjeta.
+pub fn retro_card_custom_header(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    icon: Option<SectionIcon>,
+    title: &str,
+    add_header_right: impl FnOnce(&mut egui::Ui),
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
     let frame = egui::Frame::new()
         .fill(p.crt_panel_bg)
         .stroke(Stroke::new(1.5, p.crt_panel_border))
@@ -413,15 +458,9 @@ pub fn retro_card(
                     .size(13.0)
                     .color(p.crt_text),
             );
-            if let Some(badge) = right_badge {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(badge)
-                            .size(11.0)
-                            .color(p.amber),
-                    );
-                });
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                add_header_right(ui);
+            });
         });
 
         // Separador nítido retro

@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::audio::meter::AudioLevelMonitor;
-use crate::capture::{MonitorInfo, list_monitors};
+use crate::capture::{CameraDeviceInfo, MonitorInfo, list_cameras, list_monitors};
 use crate::config::{AppConfig, EncoderPreference, UiTheme};
 use crate::encode::h264_mft::{DetectedEncoders, detect_system_encoders};
 use crate::game_detect::{RunningApp, list_running_window_apps};
@@ -92,9 +92,10 @@ pub(crate) struct BalsUiApp {
     pub last_telemetry_poll: Instant,
     pub last_clip_event_seq: u32,
 
-    // Auto-updater, encoders detectados, monitores conectados y audio VU continuo
+    // Auto-updater, encoders detectados, monitores, cámaras conectadas y audio VU continuo
     pub detected_encoders: DetectedEncoders,
     pub monitors: Vec<MonitorInfo>,
+    pub cameras: Vec<CameraDeviceInfo>,
     pub update_state: Arc<Mutex<UpdateUiState>>,
     pub audio_meter: AudioLevelMonitor,
     pub desktop_vu_display: f32,
@@ -140,6 +141,7 @@ impl BalsUiApp {
             cfg.encoder_pref = EncoderPreference::SoftwareCpu;
         }
         let monitors = list_monitors();
+        let cameras = list_cameras();
 
         // Cargar ícono CRT 64×64 pixel-art con filtrado NEAREST (sin blur).
         let raw_icon = include_bytes!("../../assets/icon_64.rgba");
@@ -167,6 +169,7 @@ impl BalsUiApp {
             last_clip_event_seq,
             detected_encoders,
             monitors,
+            cameras,
             update_state: Arc::new(Mutex::new(UpdateUiState::Idle)),
             audio_meter: AudioLevelMonitor::start(),
             desktop_vu_display: 0.0,
@@ -245,6 +248,10 @@ impl BalsUiApp {
 
     pub fn refresh_monitors(&mut self) {
         self.monitors = list_monitors();
+    }
+
+    pub fn refresh_cameras(&mut self) {
+        self.cameras = list_cameras();
     }
 
     pub fn refresh_clips(&mut self) {

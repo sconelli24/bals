@@ -60,6 +60,7 @@ const IDM_DUR_120: usize = 1033;
 const IDM_TOGGLE_MIC: usize = 1040;
 const IDM_TOGGLE_FULL_AUDIO: usize = 1041;
 const IDM_TOGGLE_NOTIFICATIONS: usize = 1042;
+const IDM_TOGGLE_CAMERA: usize = 1043;
 const IDM_OPEN_CLIPS: usize = 1050;
 const IDM_OPEN_CONFIG: usize = 1051;
 const IDM_EXIT: usize = 1099;
@@ -502,6 +503,10 @@ fn handle_menu_command(hwnd: HWND, cmd_id: usize) {
                 st.cfg.mic_enabled = !st.cfg.mic_enabled;
                 config_changed = true;
             }
+            IDM_TOGGLE_CAMERA => {
+                st.cfg.camera_enabled = !st.cfg.camera_enabled;
+                config_changed = true;
+            }
             IDM_TOGGLE_FULL_AUDIO => {
                 st.cfg.audio_capture_mode = match st.cfg.audio_capture_mode {
                     AudioCaptureMode::FullDesktop => AudioCaptureMode::GameOnly,
@@ -714,6 +719,12 @@ fn show_context_menu(hwnd: HWND) {
                 "Grabar audio de todo el escritorio",
             );
             append_checked(menu, st.cfg.mic_enabled, IDM_TOGGLE_MIC, "Grabar micrófono");
+            append_checked(
+                menu,
+                st.cfg.camera_enabled,
+                IDM_TOGGLE_CAMERA,
+                "Grabar cámara (webcam)",
+            );
             append_checked(
                 menu,
                 st.cfg.show_notifications,

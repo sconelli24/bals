@@ -308,6 +308,108 @@ pub enum AudioCaptureMode {
     FullDesktop,
 }
 
+/// Esquina de la pantalla donde se dibuja el recuadro PiP de la cámara en clips 16:9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CameraCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+}
+
+impl CameraCorner {
+    pub const ALL: [CameraCorner; 4] = [
+        CameraCorner::TopLeft,
+        CameraCorner::TopRight,
+        CameraCorner::BottomLeft,
+        CameraCorner::BottomRight,
+    ];
+
+    pub const fn arrow_label(self) -> &'static str {
+        match self {
+            CameraCorner::TopLeft => "↖",
+            CameraCorner::TopRight => "↗",
+            CameraCorner::BottomLeft => "↙",
+            CameraCorner::BottomRight => "↘",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            CameraCorner::TopLeft => "Superior izquierda",
+            CameraCorner::TopRight => "Superior derecha",
+            CameraCorner::BottomLeft => "Inferior izquierda",
+            CameraCorner::BottomRight => "Inferior derecha",
+        }
+    }
+}
+
+/// Tamaño relativo del recuadro PiP de la cámara (porcentaje del ancho del video).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CameraSize {
+    /// ~18% del ancho (ej. 346×194 en 1080p).
+    Small,
+    /// ~24% del ancho (ej. 460×258 en 1080p).
+    #[default]
+    Medium,
+    /// ~30% del ancho (ej. 576×324 en 1080p).
+    Large,
+}
+
+impl CameraSize {
+    pub const ALL: [CameraSize; 3] = [CameraSize::Small, CameraSize::Medium, CameraSize::Large];
+
+    pub const fn width_fraction(self) -> f64 {
+        match self {
+            CameraSize::Small => 0.18,
+            CameraSize::Medium => 0.24,
+            CameraSize::Large => 0.30,
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            CameraSize::Small => "S",
+            CameraSize::Medium => "M",
+            CameraSize::Large => "L",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            CameraSize::Small => "Chico (18% ancho)",
+            CameraSize::Medium => "Mediano (24% ancho)",
+            CameraSize::Large => "Grande (30% ancho)",
+        }
+    }
+}
+
+/// Preset de resolución y cuadros por segundo para la cámara (ej. `720p30`, `720p60`, `1080p30`, `1080p60`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CameraPreset {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+impl CameraPreset {
+    pub fn label(self) -> String {
+        format!("{}p{}", self.height, self.fps)
+    }
+}
+
+/// Configuración resuelta de la fuente de cámara para la sesión activa.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraConfig {
+    pub enabled: bool,
+    pub device_id: Option<String>,
+    pub preset: Option<CameraPreset>,
+    pub corner: CameraCorner,
+    pub size: CameraSize,
+    pub mirror: bool,
+}
+
 /// Tema retro seleccionable para la interfaz de consola CRT de Bals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum UiTheme {
@@ -366,6 +468,22 @@ pub struct AppConfig {
     pub game_volume: f32,
     pub mic_volume: f32,
     pub capture_cursor: bool,
+    /// Estirar resoluciones más angostas que 16:9 (ej. 4:3, 5:4, 16:10) para clipearlas
+    /// exactamente como las ve quien juega estirado, sin barras negras laterales.
+    pub stretch_aspect_ratio: bool,
+    /// Activar superposición de cámara (webcam PiP) en los clips.
+    pub camera_enabled: bool,
+    /// Identificador estable (symbolic link Media Foundation) de la cámara elegida;
+    /// `None` usa la primera cámara detectada.
+    pub selected_camera: Option<String>,
+    /// Resolución y FPS elegidos para la cámara (`None` = automático ~720p30 o mejor disponible).
+    pub camera_preset: Option<CameraPreset>,
+    /// Esquina donde se ubica la cámara en el video 16:9.
+    pub camera_corner: CameraCorner,
+    /// Tamaño del recuadro de la cámara.
+    pub camera_size: CameraSize,
+    /// Invertir horizontalmente (efecto espejo) la imagen de la cámara.
+    pub camera_mirror: bool,
     pub sound_feedback: bool,
     /// Mostrar notificaciones de Windows al guardar un clip o avisar de errores.
     pub show_notifications: bool,
@@ -398,6 +516,13 @@ impl Default for AppConfig {
             game_volume: 1.0,
             mic_volume: 1.0,
             capture_cursor: true,
+            stretch_aspect_ratio: true,
+            camera_enabled: false,
+            selected_camera: None,
+            camera_preset: None,
+            camera_corner: CameraCorner::BottomRight,
+            camera_size: CameraSize::Medium,
+            camera_mirror: true,
             sound_feedback: true,
             show_notifications: true,
             auto_update: true,
@@ -427,6 +552,17 @@ impl AppConfig {
             game_volume: self.game_volume,
             mic_volume: self.mic_volume,
             ..AudioConfig::default()
+        }
+    }
+
+    pub fn camera_config(&self) -> CameraConfig {
+        CameraConfig {
+            enabled: self.camera_enabled,
+            device_id: self.selected_camera.clone(),
+            preset: self.camera_preset,
+            corner: self.camera_corner,
+            size: self.camera_size,
+            mirror: self.camera_mirror,
         }
     }
 
@@ -534,6 +670,13 @@ mod tests {
         let cfg: AppConfig = toml::from_str(legacy_toml).expect("debería ignorar video_codec");
         assert_eq!(cfg.capture_mode, CaptureMode::ManualMonitor);
         assert_eq!(cfg.selected_monitor, None);
+        assert!(cfg.stretch_aspect_ratio);
+        assert!(!cfg.camera_enabled);
+        assert_eq!(cfg.selected_camera, None);
+        assert_eq!(cfg.camera_preset, None);
+        assert_eq!(cfg.camera_corner, CameraCorner::BottomRight);
+        assert_eq!(cfg.camera_size, CameraSize::Medium);
+        assert!(cfg.camera_mirror);
     }
 
     #[test]

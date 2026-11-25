@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::config::{
-    AudioCaptureMode, CaptureMode, EncoderPreference, FrameRate, QualityPreset, ReplayDuration,
-    Resolution, UiTheme, VideoConfig,
+    AudioCaptureMode, CameraCorner, CameraSize, CaptureMode, EncoderPreference, FrameRate,
+    QualityPreset, ReplayDuration, Resolution, UiTheme, VideoConfig,
 };
 use crate::ui::theme::RetroPalette;
 use crate::ui::widgets::{
-    SectionIcon, draw_led_vu_meter, retro_card, retro_checkbox, retro_pill,
+    SectionIcon, draw_led_vu_meter, retro_card, retro_card_custom_header, retro_checkbox,
+    retro_pill,
 };
 use crate::ui::{BalsUiApp, UpdateUiState, open_in_shell};
 use crate::updater::{CURRENT_VERSION, ReleaseInfo};
@@ -27,12 +28,14 @@ pub fn render_settings_tab(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPale
 
     ui.add_space(6.0);
 
-    // Fila inferior: CAPTURA Y ATAJO (izquierda) + SISTEMA Y TEMA (derecha)
+    // Fila inferior: CAPTURA Y ATAJO (izquierda) + CÁMARA y SISTEMA Y TEMA (derecha)
     ui.columns(2, |cols| {
         cols[0].vertical(|ui| {
             render_capture_hotkey_card(app, ui, p);
         });
         cols[1].vertical(|ui| {
+            render_camera_card(app, ui, p);
+            ui.add_space(6.0);
             render_system_card(app, ui, p);
         });
     });
@@ -539,11 +542,15 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
 
             ui.add_space(6.0);
 
-            // Checkboxes en 2 columnas limpias
+            // Checkboxes en 2 columnas limpias (6 slots simétricos)
             ui.columns(2, |c| {
                 retro_checkbox(&mut c[0], p, &mut app.cfg.capture_cursor, "Capturar cursor");
                 retro_checkbox(&mut c[0], p, &mut app.cfg.sound_feedback, "Sonido al guardar");
                 retro_checkbox(&mut c[0], p, &mut app.cfg.show_notifications, "Notificaciones");
+                retro_checkbox(&mut c[1], p, &mut app.cfg.stretch_aspect_ratio, "Estirar 4:3")
+                    .on_hover_text(
+                        "Estira juegos en 4:3 / 5:4 / 16:10 a 16:9 completo tal como los ves al jugar (sin barras negras)",
+                    );
                 retro_checkbox(&mut c[1], p, &mut app.cfg.auto_update, "Auto-actualizar");
                 retro_checkbox(
                     &mut c[1],
@@ -554,6 +561,191 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
             });
         },
     );
+}
+
+fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
+    let active_cam_idx = if app.cameras.is_empty() {
+        None
+    } else {
+        Some(
+            app.cfg
+                .selected_camera
+                .as_deref()
+                .and_then(|sel| {
+                    app.cameras
+                        .iter()
+                        .position(|c| c.symbolic_link.eq_ignore_ascii_case(sel))
+                })
+                .unwrap_or(0),
+        )
+    };
+
+    let cam_enabled = app.cfg.camera_enabled;
+    let active_cam_presets = active_cam_idx.map(|i| app.cameras[i].supported_presets.clone());
+    let resolved_preset =
+        active_cam_idx.and_then(|i| app.cameras[i].resolve_preset(app.cfg.camera_preset));
+    let mut cycle_preset = false;
+
+    retro_card_custom_header(
+        ui,
+        p,
+        Some(SectionIcon::Camera),
+        "CÁMARA (WEBCAM)",
+        |ui| {
+            if !cam_enabled {
+                ui.label(egui::RichText::new("OFF · 0% CPU").size(11.0).color(p.amber));
+            } else if active_cam_idx.is_some() {
+                let preset_txt = resolved_preset
+                    .map(|pr| format!("PiP · {}", pr.label()))
+                    .unwrap_or_else(|| "PiP · AUTO".to_string());
+                let presets = active_cam_presets.as_deref().unwrap_or(&[]);
+                let has_multiple = presets.len() > 1;
+                let hover = if has_multiple {
+                    let list = presets
+                        .iter()
+                        .map(|pr| pr.label())
+                        .collect::<Vec<_>>()
+                        .join(" → ");
+                    format!("Clic para cambiar resolución y FPS de la cámara\nDisponibles: {list}")
+                } else if let Some(only) = resolved_preset {
+                    format!("Único formato disponible en esta cámara: {}", only.label())
+                } else {
+                    "Formato automático detectado por la cámara".to_string()
+                };
+
+                let pill_w = (preset_txt.chars().count() as f32 * 6.8 + 14.0).max(82.0);
+                if retro_pill(ui, p, has_multiple, &preset_txt, vec2(pill_w, 19.0))
+                    .on_hover_text(hover)
+                    .clicked()
+                    && has_multiple
+                {
+                    cycle_preset = true;
+                }
+            } else {
+                ui.label(egui::RichText::new("SIN CÁMARA").size(11.0).color(p.amber));
+            }
+        },
+        |ui| {
+            let sp = ui.spacing().item_spacing.x;
+
+            // Fila 1: Toggle activar + selector de dispositivo + botón refrescar USB
+            ui.horizontal(|ui| {
+                retro_checkbox(ui, p, &mut app.cfg.camera_enabled, "ACTIVAR")
+                    .on_hover_text("Incluye la webcam en el clip (se aplica en vivo sin perder el buffer)");
+
+                ui.add_space(4.0);
+
+                let act_w = 38.0;
+                let dev_w = (ui.available_width() - act_w - sp).max(110.0);
+
+                if let Some(current_idx) = active_cam_idx {
+                    let current = &app.cameras[current_idx];
+                    let max_chars = ((dev_w - 18.0) / 6.5).max(10.0) as usize;
+                    let short_name = truncate_label(&current.friendly_name, max_chars);
+                    let dev_label = if app.cameras.len() > 1 {
+                        format!("{short_name} ({}/{})", current_idx + 1, app.cameras.len())
+                    } else {
+                        short_name
+                    };
+                    let hover = if app.cameras.len() > 1 {
+                        format!(
+                            "Cámara activa: {}\nClic para cambiar a la siguiente cámara detectada",
+                            current.friendly_name
+                        )
+                    } else {
+                        format!("Cámara detectada: {}", current.friendly_name)
+                    };
+
+                    if retro_pill(ui, p, app.cfg.camera_enabled, &dev_label, vec2(dev_w, 21.0))
+                        .on_hover_text(hover)
+                        .clicked()
+                        && app.cameras.len() > 1
+                    {
+                        let next = (current_idx + 1) % app.cameras.len();
+                        app.cfg.selected_camera = Some(app.cameras[next].symbolic_link.clone());
+                        app.cfg.camera_preset =
+                            app.cameras[next].resolve_preset(app.cfg.camera_preset);
+                    }
+                } else {
+                    ui.add_sized(
+                        vec2(dev_w, 20.0),
+                        egui::Label::new(
+                            egui::RichText::new("Sin cámaras detectadas")
+                                .size(10.5)
+                                .color(p.crt_muted),
+                        ),
+                    );
+                }
+
+                if retro_pill(ui, p, false, "ACT", vec2(act_w, 21.0))
+                    .on_hover_text("Volver a detectar cámaras USB conectadas")
+                    .clicked()
+                {
+                    app.refresh_cameras();
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Fila 2: 4 esquinas + 3 tamaños (S/M/L) + Espejo (habilitado cuando la cámara está activa)
+            ui.add_enabled_ui(app.cfg.camera_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for corner in CameraCorner::ALL {
+                        if retro_pill(
+                            ui,
+                            p,
+                            app.cfg.camera_corner == corner,
+                            corner.arrow_label(),
+                            vec2(26.0, 21.0),
+                        )
+                        .on_hover_text(format!("Esquina: {}", corner.description()))
+                        .clicked()
+                        {
+                            app.cfg.camera_corner = corner;
+                        }
+                    }
+
+                    ui.add_space(6.0);
+
+                    for size in CameraSize::ALL {
+                        if retro_pill(
+                            ui,
+                            p,
+                            app.cfg.camera_size == size,
+                            size.short_label(),
+                            vec2(26.0, 21.0),
+                        )
+                        .on_hover_text(format!("Tamaño: {}", size.description()))
+                        .clicked()
+                        {
+                            app.cfg.camera_size = size;
+                        }
+                    }
+
+                    ui.add_space(6.0);
+
+                    retro_checkbox(ui, p, &mut app.cfg.camera_mirror, "Espejo")
+                        .on_hover_text("Invierte horizontalmente la imagen de la webcam");
+                });
+            });
+        },
+    );
+
+    if cycle_preset {
+        if let Some(idx) = active_cam_idx {
+            app.cfg.camera_preset = app.cameras[idx].next_preset(resolved_preset);
+        }
+    }
+}
+
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars || max_chars < 4 {
+        return s.to_string();
+    }
+    let head: String = chars[..max_chars - 1].iter().collect();
+    format!("{head}…")
 }
 
 fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
@@ -607,7 +799,7 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                 retro_checkbox(ui, p, &mut app.cfg.crt_scanlines, "CRT");
             });
 
-            ui.add_space(10.0);
+            ui.add_space(6.0);
 
             // Botón principal GUARDAR (sin corchetes) + Auto-updater
             let avail_w = ui.available_width();

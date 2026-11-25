@@ -1,5 +1,8 @@
+pub mod camera;
 pub mod dxgi_dup;
 pub mod wgc;
+
+pub use camera::{CameraCapture, CameraDeviceInfo, list_cameras};
 
 use anyhow::Result;
 use tracing::warn;

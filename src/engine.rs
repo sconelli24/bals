@@ -7,7 +7,11 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, GetCurrentThread, SetThreadPriority, SetWaitableTimer,
@@ -20,13 +24,16 @@ use windows::core::PCWSTR;
 use crate::audio::AudioPipeline;
 use crate::buffer::ReplayBuffer;
 use crate::capture::{
-    CaptureTarget, FrameCapture, is_windows_11_or_later, resolve_monitor_target,
+    CameraCapture, CaptureTarget, CapturedFrame, FrameCapture, is_windows_11_or_later,
+    resolve_monitor_target,
 };
 use crate::clock;
-use crate::config::{AppConfig, AudioCaptureMode, AudioSource, CaptureMode, VideoConfig};
+use crate::config::{
+    AppConfig, AudioCaptureMode, AudioSource, CameraConfig, CaptureMode, VideoConfig,
+};
 use crate::d3d::SharedD3DDevice;
 use crate::encode::h264_mft::H264Encoder;
-use crate::encode::video_processor::GpuNv12Converter;
+use crate::encode::video_processor::{CameraOverlay, GpuNv12Converter};
 use crate::game_detect::{DetectedGame, detect_foreground_game, is_process_alive};
 use crate::ipc::{TelemetryState, TelemetryWriter};
 use crate::muxer::{WriteStats, generate_clip_path, write_mp4_clip};
@@ -186,6 +193,16 @@ struct ActiveSession {
     encoder: H264Encoder,
     encoder_label: String,
     audio: Option<AudioPipeline>,
+    /// Fuente opcional de webcam (solo abierta cuando `camera_cfg.enabled == true`).
+    camera: Option<CameraCapture>,
+    camera_cfg: CameraConfig,
+    /// Textura BGRA8 reutilizable en VRAM para la webcam (`D3D11_USAGE_DEFAULT`).
+    cam_gpu_tex: Option<(ID3D11Texture2D, u32, u32)>,
+    /// Último frame del juego/monitor retenido para recomponer cámara incluso en pantallas estáticas.
+    last_game_frame: Option<CapturedFrame>,
+    /// Fuerza recomposición NV12 al cambiar esquina/tamaño/espejo/estirado 4:3 en caliente.
+    layout_dirty: bool,
+    stretch_aspect_ratio: bool,
     replay_buffer: ReplayBuffer,
     video_config: VideoConfig,
     /// Reloj QPC de inicio de la sesión para alinear video CFR (0, dt, 2*dt...) con el audio.
@@ -230,9 +247,27 @@ impl ActiveSession {
             out_w,
             out_h,
             video_config.fps.as_u32(),
+            cfg.stretch_aspect_ratio,
         )?;
         let encoder = H264Encoder::new(&d3d, video_config)?;
         let encoder_label = encoder.hardware_label();
+
+        let camera_cfg = cfg.camera_config();
+        let camera = if camera_cfg.enabled {
+            match CameraCapture::start(
+                camera_cfg.device_id.as_deref(),
+                camera_cfg.mirror,
+                camera_cfg.preset,
+            ) {
+                Ok(cam) => Some(cam),
+                Err(err) => {
+                    warn!("Cámara no disponible ({err:#}); grabando sin superposición de cámara");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let max_bytes = cfg.max_buffer_ram_mb.max(32) * 1024 * 1024;
         let mut replay_buffer = ReplayBuffer::new(cfg.replay_duration.as_secs(), max_bytes);
@@ -281,6 +316,12 @@ impl ActiveSession {
             encoder,
             encoder_label,
             audio,
+            camera,
+            camera_cfg,
+            cam_gpu_tex: None,
+            last_game_frame: None,
+            layout_dirty: false,
+            stretch_aspect_ratio: cfg.stretch_aspect_ratio,
             replay_buffer,
             video_config,
             qpc_origin_100ns,
@@ -297,6 +338,93 @@ impl ActiveSession {
 
     fn is_paused(&self) -> bool {
         self.paused_since_100ns.is_some()
+    }
+
+    fn telemetry_encoder_label(&self) -> String {
+        if self.camera.is_some() {
+            format!("{} · CAM", self.encoder_label)
+        } else {
+            self.encoder_label.clone()
+        }
+    }
+
+    /// Aplica cambios de cámara y estirado 4:3 en vivo sin reiniciar el encoder ni perder el Replay Buffer.
+    fn apply_live_visual_config(&mut self, cfg: &AppConfig) {
+        if cfg.stretch_aspect_ratio != self.stretch_aspect_ratio {
+            self.stretch_aspect_ratio = cfg.stretch_aspect_ratio;
+            self.converter.set_stretch_narrow(cfg.stretch_aspect_ratio);
+            self.layout_dirty = true;
+            info!(
+                stretch_4_3 = cfg.stretch_aspect_ratio,
+                "Escalado de relación de aspecto actualizado en vivo"
+            );
+        }
+
+        let new_cam = cfg.camera_config();
+        if new_cam == self.camera_cfg {
+            return;
+        }
+
+        if !new_cam.enabled {
+            if self.camera.take().is_some() {
+                info!("Cámara desactivada en vivo (LED apagado, 0% CPU/GPU)");
+            }
+            self.cam_gpu_tex = None;
+            self.layout_dirty = true;
+        } else {
+            let needs_reopen = self.camera.is_none()
+                || new_cam.device_id != self.camera_cfg.device_id
+                || new_cam.preset != self.camera_cfg.preset
+                || self.camera.as_ref().is_some_and(|c| !c.is_alive());
+
+            if needs_reopen {
+                self.camera = None;
+                self.cam_gpu_tex = None;
+                match CameraCapture::start(
+                    new_cam.device_id.as_deref(),
+                    new_cam.mirror,
+                    new_cam.preset,
+                ) {
+                    Ok(cam) => {
+                        self.camera = Some(cam);
+                        self.layout_dirty = true;
+                    }
+                    Err(err) => {
+                        warn!("No se pudo activar la cámara en vivo ({err:#})");
+                    }
+                }
+            } else if let Some(cam) = &self.camera {
+                if new_cam.mirror != self.camera_cfg.mirror {
+                    cam.set_mirror(new_cam.mirror);
+                }
+                if new_cam.corner != self.camera_cfg.corner || new_cam.size != self.camera_cfg.size {
+                    self.layout_dirty = true;
+                }
+            }
+        }
+
+        self.camera_cfg = new_cam;
+    }
+
+    fn poll_camera_frame(&mut self) -> bool {
+        if self.camera.as_ref().is_some_and(|c| !c.is_alive()) {
+            warn!("La cámara se desconectó; continuando grabación sin superposición de cámara");
+            self.camera = None;
+            self.cam_gpu_tex = None;
+            return true;
+        }
+
+        let Some(fresh_cam) = self.camera.as_ref().and_then(|c| c.take_latest()) else {
+            return false;
+        };
+
+        match upload_camera_frame_to_gpu(&self.d3d, &mut self.cam_gpu_tex, &fresh_cam) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("No se pudo subir frame de webcam a VRAM ({err:#})");
+                false
+            }
+        }
     }
 
     /// Evalúa si el juego está minimizado o en Alt-Tab sin frames activos.
@@ -391,12 +519,26 @@ impl ActiveSession {
         let pause_changed = self.update_alt_tab_pause();
 
         if self.is_paused() {
+            if let Some(cam) = &self.camera {
+                let _ = cam.take_latest();
+            }
             if let Some(cap) = &self.capture {
                 if let Some(fresh) = cap.take_latest() {
                     self.last_wgc_frame_at = Instant::now();
-                    if let Ok(nv12) = self.converter.convert(&fresh.texture, fresh.width, fresh.height) {
+                    let cam_overlay = make_camera_overlay(
+                        self.camera.is_some(),
+                        self.cam_gpu_tex.as_ref(),
+                        &self.camera_cfg,
+                    );
+                    if let Ok(nv12) = self.converter.convert_with_camera(
+                        &fresh.texture,
+                        fresh.width,
+                        fresh.height,
+                        cam_overlay,
+                    ) {
                         self.last_nv12 = Some(nv12);
                     }
+                    self.last_game_frame = Some(fresh);
                     return Ok(self.update_alt_tab_pause() || pause_changed);
                 }
             }
@@ -426,15 +568,40 @@ impl ActiveSession {
             }
         }
 
-        // 1. Tomar el frame más reciente del buzón WGC (si llegó uno nuevo desde el tick anterior).
+        // 1. Tomar el frame más reciente del juego/monitor y de la cámara (si está activa).
+        let mut needs_composite = self.layout_dirty;
+        self.layout_dirty = false;
+
         if let Some(cap) = &self.capture {
             if let Some(fresh) = cap.take_latest() {
                 self.last_wgc_frame_at = Instant::now();
-                match self.converter.convert(&fresh.texture, fresh.width, fresh.height) {
+                self.last_game_frame = Some(fresh);
+                needs_composite = true;
+            }
+        }
+
+        if self.poll_camera_frame() {
+            needs_composite = true;
+        }
+
+        if needs_composite {
+            if let Some(game) = self.last_game_frame.as_ref() {
+                let cam_overlay = make_camera_overlay(
+                    self.camera.is_some(),
+                    self.cam_gpu_tex.as_ref(),
+                    &self.camera_cfg,
+                );
+                match self.converter.convert_with_camera(
+                    &game.texture,
+                    game.width,
+                    game.height,
+                    cam_overlay,
+                ) {
                     Ok(nv12) => self.last_nv12 = Some(nv12),
                     Err(err) => {
                         warn!("Conversión transitoria falló durante transición de ventana ({err:#}); preservando ReplayBuffer");
                         self.capture = None;
+                        self.last_game_frame = None;
                         self.paused_since_100ns = Some(clock::now_100ns());
                         return Ok(true);
                     }
@@ -676,6 +843,13 @@ fn apply_config_update(
 
     let volumes_changed = (new_cfg.game_volume - cfg.game_volume).abs() > 0.001
         || (new_cfg.mic_volume - cfg.mic_volume).abs() > 0.001;
+    let visual_live_changed = new_cfg.stretch_aspect_ratio != cfg.stretch_aspect_ratio
+        || new_cfg.camera_enabled != cfg.camera_enabled
+        || new_cfg.selected_camera != cfg.selected_camera
+        || new_cfg.camera_preset != cfg.camera_preset
+        || new_cfg.camera_corner != cfg.camera_corner
+        || new_cfg.camera_size != cfg.camera_size
+        || new_cfg.camera_mirror != cfg.camera_mirror;
 
     let prev_state = session.as_ref().map(|s| s.state.clone());
     *cfg = new_cfg;
@@ -713,15 +887,20 @@ fn apply_config_update(
             start_manual_session(cfg, session);
             publish_status(session, cfg, shared_status, event_tx, telemetry);
         }
-    } else if volumes_changed {
-        if let Some(active) = session.as_ref() {
-            if let Some(audio) = active.audio.as_ref() {
-                audio.set_volumes(cfg.game_volume, cfg.mic_volume);
-                info!(
-                    game_vol = format!("{:.0}%", cfg.game_volume * 100.0),
-                    mic_vol = format!("{:.0}%", cfg.mic_volume * 100.0),
-                    "Volúmenes actualizados en vivo sin interrumpir el Replay Buffer"
-                );
+    } else if volumes_changed || visual_live_changed {
+        if let Some(active) = session.as_mut() {
+            if volumes_changed {
+                if let Some(audio) = active.audio.as_ref() {
+                    audio.set_volumes(cfg.game_volume, cfg.mic_volume);
+                    info!(
+                        game_vol = format!("{:.0}%", cfg.game_volume * 100.0),
+                        mic_vol = format!("{:.0}%", cfg.mic_volume * 100.0),
+                        "Volúmenes actualizados en vivo sin interrumpir el Replay Buffer"
+                    );
+                }
+            }
+            if visual_live_changed {
+                active.apply_live_visual_config(cfg);
             }
         }
         publish_telemetry(session, cfg, telemetry);
@@ -903,7 +1082,7 @@ fn handle_save_clip(
     let telemetry_clone = Arc::clone(telemetry);
     let target_secs = cfg.replay_duration.as_secs();
     let state_snap = active.state.clone();
-    let enc_snap = active.encoder_label.clone();
+    let enc_snap = active.telemetry_encoder_label();
 
     let _ = thread::Builder::new()
         .name("bals-mp4-writer".to_string())
@@ -998,13 +1177,14 @@ fn publish_telemetry(
 
     if let Some(active) = session {
         let (tstate, gname) = recording_state_to_telemetry(&active.state);
+        let enc_lbl = active.telemetry_encoder_label();
         writer.publish(
             tstate,
             cfg.replay_duration.as_secs(),
             active.replay_buffer.buffered_secs() as f32,
             (active.replay_buffer.total_bytes() as f64 / (1024.0 * 1024.0)) as f32,
             gname,
-            &active.encoder_label,
+            &enc_lbl,
         );
     } else {
         writer.publish(
@@ -1047,4 +1227,72 @@ fn publish_status(
     if let Ok(guard) = shared_status.lock() {
         let _ = event_tx.send(EngineEvent::StatusChanged(guard.clone()));
     }
+}
+
+fn make_camera_overlay<'a>(
+    camera_active: bool,
+    cam_gpu_tex: Option<&'a (ID3D11Texture2D, u32, u32)>,
+    cfg: &CameraConfig,
+) -> Option<CameraOverlay<'a>> {
+    if !camera_active {
+        return None;
+    }
+    let (tex, w, h) = cam_gpu_tex?;
+    Some(CameraOverlay {
+        texture: tex,
+        width: *w,
+        height: *h,
+        corner: cfg.corner,
+        size: cfg.size,
+    })
+}
+
+/// Sube un frame `BGRA8` de la webcam a una textura `D3D11_USAGE_DEFAULT` reutilizable en VRAM
+/// (compatible con `ID3D11VideoDevice::CreateVideoProcessorInputView` en NVIDIA, AMD e Intel).
+fn upload_camera_frame_to_gpu(
+    d3d: &SharedD3DDevice,
+    slot: &mut Option<(ID3D11Texture2D, u32, u32)>,
+    frame: &crate::capture::camera::CameraFrame,
+) -> Result<()> {
+    let needs_new = slot
+        .as_ref()
+        .is_none_or(|(_, w, h)| *w != frame.width || *h != frame.height);
+
+    if needs_new {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: frame.width,
+            Height: frame.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex = None;
+        unsafe { d3d.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+            .context("CreateTexture2D (webcam BGRA8) falló")?;
+        let tex = tex.context("CreateTexture2D (webcam) devolvió None")?;
+        *slot = Some((tex, frame.width, frame.height));
+    }
+
+    if let Some((tex, _, _)) = slot.as_ref() {
+        unsafe {
+            d3d.context.UpdateSubresource(
+                tex,
+                0,
+                None,
+                frame.bgra.as_ptr().cast(),
+                frame.width * 4,
+                0,
+            );
+        }
+    }
+
+    Ok(())
 }

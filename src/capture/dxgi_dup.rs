@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
@@ -30,9 +30,9 @@ use crate::capture::{CaptureTarget, CapturedFrame};
 use crate::clock;
 use crate::d3d::SharedD3DDevice;
 
-/// Anillo de 3 texturas BGRA en VRAM para copiar el desktop de DXGI sin bloquear a DWM
-/// y sin sobreescribir la textura que el VideoProcessor esté leyendo en paralelo.
-const COPY_RING_SIZE: usize = 3;
+/// Anillo de 4 texturas BGRA en VRAM para copiar el desktop de DXGI sin bloquear a DWM,
+/// permitiendo conservar `last_game_frame` para recomponer webcam en pantalla estática.
+const COPY_RING_SIZE: usize = 4;
 
 #[derive(Default)]
 pub struct DxgiCaptureStats {
@@ -347,7 +347,7 @@ fn create_bgra_ring(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
     };

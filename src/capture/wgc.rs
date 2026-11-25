@@ -67,8 +67,9 @@ impl WgcCapture {
             .Size()
             .context("No se pudo obtener el tamaño inicial del GraphicsCaptureItem")?;
 
-        // 3 buffers en el FramePool: 1 en WGC, 1 en el buzón `latest_frame` y 1 en vuelo en el VideoProcessor.
-        let pool_buffers = 3;
+        // 4 buffers en el FramePool: 1 en WGC, 1 en el buzón `latest_frame`, 1 retenido como
+        // `last_game_frame` (para recomponer cámara sobre pantalla estática) y 1 en vuelo en el VideoProcessor.
+        let pool_buffers = 4;
 
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &d3d.winrt_device,
