@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, pos2, vec2};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
@@ -30,8 +30,10 @@ use crate::trimmer::{
 };
 use crate::ui::theme::{RetroPalette, apply_egui_theme};
 use crate::ui::widgets::{
-    TrimDragHandle, draw_crt_recess, draw_mini_bezel_vu, draw_scanlines, draw_status_led,
-    draw_vent_grille, hardware_action_button, hardware_tab_button,
+    TrimDragHandle, draw_crt_monitor_shell, draw_crt_recess, draw_dual_vent_grille,
+    draw_hardware_status_plate, draw_hardware_tab_rocker, draw_mini_bezel_vu,
+    draw_power_led_socket, draw_recessed_bay, draw_scanlines, draw_status_led,
+    hardware_action_button,
 };
 use crate::updater::{self, CURRENT_VERSION, ReleaseInfo};
 
@@ -691,8 +693,8 @@ pub fn run_gui() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Bals")
             .with_icon(Arc::new(icon))
-            .with_inner_size([1080.0, 710.0])
-            .with_min_inner_size([1000.0, 700.0]),
+            .with_inner_size([1100.0, 745.0])
+            .with_min_inner_size([1040.0, 720.0]),
         ..Default::default()
     };
 
@@ -732,234 +734,168 @@ impl eframe::App for BalsUiApp {
         let rec_pulse = ((time_s * 3.8).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
 
         // =========================================================================
-        // 1. BISEL SUPERIOR DE CARCASA HARDWARE CRT (Opción C)
+        // CARCASA UNIFICADA DE MONITOR CRT RETRO (una sola pieza moldeada en 3D)
         // =========================================================================
-        let top_frame = egui::Frame::new()
-            .fill(p.chassis_bg)
-            .inner_margin(egui::Margin::symmetric(14, 8))
-            .stroke(Stroke::new(1.5, p.chassis_outline));
-
-        egui::Panel::top("bals_crt_top_bezel")
-            .frame(top_frame)
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // Ícono pixel-art CRT + Branding BALS
-                    if let Some(tex) = &self.logo_texture {
-                        let (lrect, _) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
-                        ui.painter().image(
-                            tex.id(),
-                            lrect,
-                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                    }
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(
-                            egui::RichText::new("BALS")
-                                .strong()
-                                .size(19.0)
-                                .color(p.chassis_text),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("CRT-60 v{CURRENT_VERSION}"))
-                                .size(10.0)
-                                .color(p.chassis_muted),
-                        );
-                    });
-
-                    ui.add_space(10.0);
-
-                    // Pestañas físicas estilo gatillo consola [L1] / [R1]
-                    if hardware_tab_button(ui, &p, self.tab == Tab::Settings, "L1", "AJUSTES")
-                        .clicked()
-                    {
-                        self.tab = Tab::Settings;
-                    }
-                    let clips_lbl = format!("CLIPS & DECK ({})", self.clips.len());
-                    if hardware_tab_button(ui, &p, self.tab == Tab::Clips, "R1", &clips_lbl)
-                        .clicked()
-                    {
-                        self.set_listening_hotkey(false);
-                        self.tab = Tab::Clips;
-                        self.refresh_clips();
-                    }
-
-                    // Lado derecho: LCD de telemetría en vivo + botones físicos + LED power
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // LED verde físico de encendido
-                        let (led_rect, led_resp) =
-                            ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                        draw_status_led(
-                            ui.painter(),
-                            led_rect.center(),
-                            4.5,
-                            p.led_green,
-                            self.daemon_running,
-                            0.4,
-                        );
-                        led_resp.on_hover_text(if self.daemon_running {
-                            "Daemon activo en bandeja"
-                        } else {
-                            "Daemon detenido"
-                        });
-
-                        if self.daemon_running {
-                            let is_rec = self
-                                .telemetry
-                                .as_ref()
-                                .is_some_and(|t| t.state != TelemetryState::Idle);
-                            let rec_lbl = if is_rec { "⏸ PAUSA" } else { "▶ REC" };
-                            if hardware_action_button(
-                                ui,
-                                &p,
-                                rec_lbl,
-                                p.chassis_btn_bg,
-                                p.chassis_text,
-                                30.0,
-                            )
-                            .on_hover_text("Iniciar o pausar Replay Buffer manual (F5)")
-                            .clicked()
-                            {
-                                ipc::notify_toggle_record();
-                                self.set_banner("Estado de grabación alternado.", false);
-                            }
-
-                            let clip_btn_lbl = format!("[{}] CLIP", self.cfg.save_clip_hotkey);
-                            if hardware_action_button(
-                                ui,
-                                &p,
-                                &clip_btn_lbl,
-                                p.danger,
-                                p.danger_text,
-                                30.0,
-                            )
-                            .on_hover_text("Guardar los últimos segundos del Replay Buffer")
-                            .clicked()
-                            {
-                                ipc::notify_save_clip();
-                                self.set_banner("Solicitud de clip enviada al motor.", false);
-                            }
-                        }
-
-                        // Pantalla LCD empotrada con telemetría en tiempo real
-                        draw_live_telemetry_lcd(ui, &p, self.daemon_running, &self.telemetry, rec_pulse);
-                    });
-                });
-            });
-
-        // =========================================================================
-        // 2. BISEL INFERIOR DE CARCASA HARDWARE CRT (Opción C + Leyenda Consola A)
-        // =========================================================================
-        let bottom_frame = egui::Frame::new()
-            .fill(p.chassis_bg)
-            .inner_margin(egui::Margin::symmetric(14, 6))
-            .stroke(Stroke::new(1.5, p.chassis_outline));
-
-        egui::Panel::bottom("bals_crt_bottom_bezel")
-            .frame(bottom_frame)
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // Rejillas físicas de ventilación a la izquierda
-                    draw_vent_grille(ui, &p, 56.0, 22.0);
-                    ui.add_space(6.0);
-
-                    // Si hay una notificación activa, mostrarla en un visor LCD; si no, mostrar mini-VU en vivo
-                    if let Some((msg, is_err, _)) = &self.banner_msg {
-                        let (brect, _) = ui.allocate_exact_size(vec2(380.0, 24.0), Sense::hover());
-                        ui.painter().rect_filled(brect, 3.0, p.crt_recess);
-                        let col = if *is_err { p.led_red } else { p.accent_bright };
-                        ui.painter().rect_stroke(
-                            brect,
-                            3.0,
-                            Stroke::new(1.2, col),
-                            StrokeKind::Inside,
-                        );
-                        ui.painter().text(
-                            pos2(brect.left() + 8.0, brect.center().y),
-                            Align2::LEFT_CENTER,
-                            msg,
-                            FontId::monospace(11.0),
-                            col,
-                        );
-                    } else {
-                        draw_mini_bezel_vu(
-                            ui,
-                            &p,
-                            self.desktop_vu_display,
-                            self.mic_vu_display,
-                            self.cfg.mic_enabled,
-                        );
-
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("[Q/E] PESTAÑAS · [CTRL+S] GUARDAR · [F5] REC")
-                                .size(10.5)
-                                .color(p.chassis_muted),
-                        );
-                    }
-
-                    // Badge derecho: estado de GPU / Encoder
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let enc_text = self
-                            .telemetry
-                            .as_ref()
-                            .filter(|_| self.daemon_running)
-                            .map(|t| t.encoder_label.as_str())
-                            .unwrap_or("MOTOR DETENIDO");
-                        let badge_w = (enc_text.chars().count() as f32 * 6.8 + 26.0).max(125.0);
-                        let (erect, _) =
-                            ui.allocate_exact_size(vec2(badge_w, 24.0), Sense::hover());
-                        ui.painter().rect_filled(erect, 3.0, p.crt_recess);
-                        ui.painter().rect_stroke(
-                            erect,
-                            3.0,
-                            Stroke::new(1.2, p.chassis_outline),
-                            StrokeKind::Inside,
-                        );
-                        draw_status_led(
-                            ui.painter(),
-                            pos2(erect.left() + 11.0, erect.center().y),
-                            3.2,
-                            if self.daemon_running {
-                                p.led_green
-                            } else {
-                                p.led_red
-                            },
-                            true,
-                            0.2,
-                        );
-                        ui.painter().text(
-                            pos2(erect.left() + 21.0, erect.center().y),
-                            Align2::LEFT_CENTER,
-                            enc_text,
-                            FontId::monospace(10.5),
-                            p.crt_text,
-                        );
-                    });
-                });
-            });
-
-        // =========================================================================
-        // 3. PANTALLA CRT EMPOTRADA CENTRAL (Contorno Chasis + Vidrio CRT + Scanlines)
-        // =========================================================================
-        let outer_center_frame = egui::Frame::new()
-            .fill(p.chassis_bg)
-            .inner_margin(egui::Margin::symmetric(14, 5));
+        let shell_frame = egui::Frame::new()
+            .fill(Color32::TRANSPARENT)
+            .inner_margin(egui::Margin::ZERO);
 
         egui::CentralPanel::default()
-            .frame(outer_center_frame)
+            .frame(shell_frame)
             .show(ui, |ui| {
-                let crt_rect = ui.available_rect_before_wrap();
-                draw_crt_recess(ui.painter(), crt_rect, &p);
+                let full_rect = ui.max_rect();
+                draw_crt_monitor_shell(ui.painter(), full_rect, &p);
 
-                let inner_frame = egui::Frame::new()
-                    .fill(Color32::TRANSPARENT)
-                    .inner_margin(egui::Margin::same(10));
+                // Márgenes físicos del chasis alrededor del monitor CRT
+                let content_rect = full_rect.shrink2(vec2(22.0, 12.0));
+                let top_h = 46.0;
+                let top_gap = 6.0;
+                let bottom_gap = 9.0;
+                let bottom_h = 30.0;
 
-                inner_frame.show(ui, |ui| {
+                let top_rect = Rect::from_min_size(
+                    content_rect.min,
+                    vec2(content_rect.width(), top_h),
+                );
+                let bottom_rect = Rect::from_min_size(
+                    pos2(content_rect.left(), content_rect.bottom() - bottom_h),
+                    vec2(content_rect.width(), bottom_h),
+                );
+                let crt_outer_rect = Rect::from_min_max(
+                    pos2(content_rect.left(), top_rect.bottom() + top_gap),
+                    pos2(content_rect.right(), bottom_rect.top() - bottom_gap),
+                );
+
+                // -----------------------------------------------------------------
+                // 1. BISEL SUPERIOR DEL MONITOR: Logo + Rocker Tabs + LCD + Botón CLIP + LED
+                // -----------------------------------------------------------------
+                ui.scope_builder(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+                    ui.horizontal_centered(|ui| {
+                        // Ícono pixel-art CRT + Branding BALS CRT-60 CLIPPER
+                        if let Some(tex) = &self.logo_texture {
+                            let (lrect, _) =
+                                ui.allocate_exact_size(vec2(42.0, 42.0), Sense::hover());
+                            ui.painter().image(
+                                tex.id(),
+                                lrect,
+                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = -1.0;
+                            ui.label(
+                                egui::RichText::new("BALS")
+                                    .strong()
+                                    .size(21.0)
+                                    .color(p.chassis_text),
+                            );
+                            ui.label(
+                                egui::RichText::new("CRT-60 CLIPPER")
+                                    .strong()
+                                    .size(9.5)
+                                    .color(p.chassis_muted),
+                            );
+                        });
+
+                        if top_rect.width() >= 1090.0 {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("v{CURRENT_VERSION}"))
+                                    .size(9.5)
+                                    .color(p.chassis_muted),
+                            );
+                        }
+
+                        ui.add_space(12.0);
+
+                        // Interruptor doble empotrado en el chasis: [ AJUSTES ] | • [ CLIPS & DECK ]
+                        let (go_settings, go_clips) = draw_hardware_tab_rocker(
+                            ui,
+                            &p,
+                            self.tab == Tab::Settings,
+                            self.clips.len(),
+                        );
+                        if go_settings {
+                            self.tab = Tab::Settings;
+                        }
+                        if go_clips {
+                            self.set_listening_hotkey(false);
+                            self.tab = Tab::Clips;
+                            self.refresh_clips();
+                        }
+
+                        // Lado derecho: LED power + Botón rojo CLIP + Switch REC/PAUSA + Visor LCD
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            draw_power_led_socket(ui, &p, self.daemon_running, 0.35)
+                                .on_hover_text(if self.daemon_running {
+                                    "Daemon activo en bandeja"
+                                } else {
+                                    "Daemon detenido"
+                                });
+
+                            if self.daemon_running {
+                                let clip_btn_lbl =
+                                    format!("[{}] GUARDAR CLIP", self.cfg.save_clip_hotkey);
+                                if hardware_action_button(
+                                    ui,
+                                    &p,
+                                    &clip_btn_lbl,
+                                    p.danger,
+                                    p.danger_text,
+                                    32.0,
+                                )
+                                .on_hover_text("Guardar los últimos segundos del Replay Buffer")
+                                .clicked()
+                                {
+                                    ipc::notify_save_clip();
+                                    self.set_banner("Solicitud de clip enviada al motor.", false);
+                                }
+
+                                let is_rec = self
+                                    .telemetry
+                                    .as_ref()
+                                    .is_some_and(|t| t.state != TelemetryState::Idle);
+                                let rec_lbl = if is_rec { "⏸" } else { "▶" };
+                                if hardware_action_button(
+                                    ui,
+                                    &p,
+                                    rec_lbl,
+                                    p.chassis_btn_bg,
+                                    p.chassis_text,
+                                    32.0,
+                                )
+                                .on_hover_text(if is_rec {
+                                    "Pausar Replay Buffer (F5)"
+                                } else {
+                                    "Iniciar Replay Buffer manual (F5)"
+                                })
+                                .clicked()
+                                {
+                                    ipc::notify_toggle_record();
+                                    self.set_banner("Estado de grabación alternado.", false);
+                                }
+                            }
+
+                            // Pantalla LCD empotrada con telemetría en vivo
+                            draw_live_telemetry_lcd(
+                                ui,
+                                &p,
+                                self.daemon_running,
+                                &self.telemetry,
+                                rec_pulse,
+                            );
+                        });
+                    });
+                });
+
+                // -----------------------------------------------------------------
+                // 2. TUBO DE VIDRIO CRT CENTRAL CON CAVIDAD BISELADA 3D Y SCANLINES
+                // -----------------------------------------------------------------
+                let glass_rect = draw_crt_recess(ui.painter(), crt_outer_rect, &p);
+                let screen_content_rect = glass_rect.shrink2(vec2(12.0, 9.0));
+
+                ui.scope_builder(egui::UiBuilder::new().max_rect(screen_content_rect), |ui| {
                     match self.tab {
                         Tab::Settings => settings_view::render_settings_tab(self, ui, &p),
                         Tab::Clips => clips_view::render_clips_tab(
@@ -971,10 +907,75 @@ impl eframe::App for BalsUiApp {
                     }
                 });
 
-                // Scanlines CRT sutiles encima de la pantalla interior (opcional)
+                // Scanlines CRT sutiles sobre el vidrio interior
                 if self.cfg.crt_scanlines {
-                    draw_scanlines(ui.painter(), crt_rect.shrink(4.0), p.crt_scanline);
+                    draw_scanlines(ui.painter(), glass_rect.shrink(4.0), p.crt_scanline);
                 }
+
+                // -----------------------------------------------------------------
+                // 3. BASE INFERIOR DEL CHASIS: Doble rejilla | VU Central | Placa Estado GPU
+                // -----------------------------------------------------------------
+                ui.scope_builder(egui::UiBuilder::new().max_rect(bottom_rect), |ui| {
+                    let row_w = bottom_rect.width();
+
+                    // Izquierda: doble rejilla de ventilación/parlante CRT
+                    let vent_rect = Rect::from_min_size(
+                        pos2(bottom_rect.left(), bottom_rect.center().y - 11.0),
+                        vec2(168.0, 22.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(vent_rect), |ui| {
+                        draw_dual_vent_grille(ui, &p, 168.0, 22.0);
+                    });
+
+                    // Centro: bahía empotrada de Audio/Mic VU (o visor LCD de notificación temporal)
+                    let center_w = if self.banner_msg.is_some() { 370.0 } else { 266.0 };
+                    let center_x = (bottom_rect.center().x - center_w * 0.5)
+                        .max(vent_rect.right() + 12.0);
+                    let center_rect = Rect::from_min_size(
+                        pos2(center_x, bottom_rect.center().y - 13.0),
+                        vec2(center_w, 26.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
+                        if let Some((msg, is_err, _)) = &self.banner_msg {
+                            let (brect, _) =
+                                ui.allocate_exact_size(vec2(center_w, 26.0), Sense::hover());
+                            draw_recessed_bay(ui.painter(), brect, &p, 3.5);
+                            let col = if *is_err { p.led_red } else { p.accent_bright };
+                            ui.painter().text(
+                                brect.center(),
+                                Align2::CENTER_CENTER,
+                                msg,
+                                FontId::monospace(10.8),
+                                col,
+                            );
+                        } else {
+                            draw_mini_bezel_vu(
+                                ui,
+                                &p,
+                                self.desktop_vu_display,
+                                self.mic_vu_display,
+                                self.cfg.mic_enabled,
+                            );
+                        }
+                    });
+
+                    // Derecha: placa hardware moldeada con estado del encoder/motor
+                    let enc_text = self
+                        .telemetry
+                        .as_ref()
+                        .filter(|_| self.daemon_running)
+                        .map(|t| t.encoder_label.as_str())
+                        .unwrap_or("MOTOR DETENIDO");
+                    let plate_w = (enc_text.chars().count() as f32 * 6.8 + 32.0)
+                        .clamp(160.0, (row_w * 0.30).max(220.0));
+                    let right_rect = Rect::from_min_size(
+                        pos2(bottom_rect.right() - plate_w, bottom_rect.center().y - 13.0),
+                        vec2(plate_w, 26.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                        draw_hardware_status_plate(ui, &p, self.daemon_running, enc_text);
+                    });
+                });
             });
     }
 }
@@ -1037,28 +1038,22 @@ fn draw_live_telemetry_lcd(
         ("STANDBY · 0% GPU".to_string(), p.led_green, false)
     };
 
-    let width = (label.chars().count() as f32 * 6.9 + 28.0).clamp(142.0, 218.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 30.0), Sense::hover());
+    let width = (label.chars().count() as f32 * 6.8 + 30.0).clamp(138.0, 206.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
     let painter = ui.painter();
 
-    painter.rect_filled(rect, 3.0, p.crt_recess);
-    painter.rect_stroke(
-        rect,
-        3.0,
-        Stroke::new(1.5, p.chassis_outline),
-        StrokeKind::Inside,
-    );
+    draw_recessed_bay(painter, rect, p, 3.5);
 
     draw_status_led(
         painter,
-        pos2(rect.left() + 12.0, rect.center().y),
-        3.6,
+        pos2(rect.left() + 13.0, rect.center().y),
+        3.8,
         led_color,
         true,
         if is_rec { rec_pulse } else { 0.15 },
     );
     painter.text(
-        pos2(rect.left() + 23.0, rect.center().y),
+        pos2(rect.left() + 24.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
         FontId::monospace(11.0),

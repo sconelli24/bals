@@ -48,6 +48,91 @@ pub fn draw_beveled_box(
     painter.rect_stroke(rect, radius, Stroke::new(1.5, outline), StrokeKind::Inside);
 }
 
+/// Interpola linealmente dos colores sRGB para generar sombreados del chasis en cualquier tema.
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// Dibuja la carcasa exterior continua del monitor CRT con bisel moldeado 3D en los 4 bordes.
+pub fn draw_crt_monitor_shell(painter: &egui::Painter, rect: Rect, p: &RetroPalette) {
+    // Base del chasis plástico
+    painter.rect_filled(rect, 0.0, p.chassis_bg);
+
+    // Suave marco moldeado exterior (luz arriba/izquierda, sombra abajo/derecha)
+    let bevel = rect.shrink(1.5);
+    let hi_soft = lerp_color(p.chassis_bg, p.chassis_highlight, 0.85);
+    let sh_soft = lerp_color(p.chassis_bg, p.chassis_shadow, 0.85);
+    let sh_deep = lerp_color(p.chassis_shadow, p.chassis_outline, 0.30);
+
+    // Bisel exterior superior e izquierdo (luz)
+    painter.line_segment(
+        [pos2(bevel.left(), bevel.top()), pos2(bevel.right(), bevel.top())],
+        Stroke::new(3.0, hi_soft),
+    );
+    painter.line_segment(
+        [pos2(bevel.left(), bevel.top()), pos2(bevel.left(), bevel.bottom())],
+        Stroke::new(3.0, hi_soft),
+    );
+    // Bisel exterior inferior y derecho (sombra profunda)
+    painter.line_segment(
+        [pos2(bevel.left(), bevel.bottom()), pos2(bevel.right(), bevel.bottom())],
+        Stroke::new(3.5, sh_deep),
+    );
+    painter.line_segment(
+        [pos2(bevel.right(), bevel.top()), pos2(bevel.right(), bevel.bottom())],
+        Stroke::new(3.5, sh_soft),
+    );
+
+    // Línea de moldeo interior sutil (da sensación de carcasa inyectada en plástico)
+    let seam = rect.shrink(5.0);
+    painter.rect_stroke(
+        seam,
+        3.0,
+        Stroke::new(1.0, lerp_color(p.chassis_bg, p.chassis_shadow, 0.25)),
+        StrokeKind::Inside,
+    );
+
+    // Contorno exterior nítido
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.5, p.chassis_outline),
+        StrokeKind::Inside,
+    );
+}
+
+/// Dibuja un hueco empotrado oscuro en el plástico del chasis (LCD, VU meter, bahía de switches).
+pub fn draw_recessed_bay(painter: &egui::Painter, rect: Rect, p: &RetroPalette, radius: f32) {
+    // Borde exterior hundido (sombra arriba/izq, brillo abajo/der)
+    let outer = rect.expand(1.2);
+    painter.line_segment(
+        [pos2(outer.left() + radius, outer.top()), pos2(outer.right() - radius, outer.top())],
+        Stroke::new(1.3, p.chassis_shadow),
+    );
+    painter.line_segment(
+        [pos2(outer.left(), outer.top() + radius), pos2(outer.left(), outer.bottom() - radius)],
+        Stroke::new(1.3, p.chassis_shadow),
+    );
+    painter.line_segment(
+        [pos2(outer.left() + radius, outer.bottom()), pos2(outer.right() - radius, outer.bottom())],
+        Stroke::new(1.3, p.chassis_highlight),
+    );
+    painter.line_segment(
+        [pos2(outer.right(), outer.top() + radius), pos2(outer.right(), outer.bottom() - radius)],
+        Stroke::new(1.3, p.chassis_highlight),
+    );
+
+    painter.rect_filled(rect, radius, p.crt_recess);
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.5, p.chassis_outline),
+        StrokeKind::Inside,
+    );
+}
+
 /// Dibuja líneas de barrido horizontales CRT sutiles sin interferir con clics.
 pub fn draw_scanlines(painter: &egui::Painter, rect: Rect, color: Color32) {
     let stroke = Stroke::new(1.0, color);
@@ -58,22 +143,110 @@ pub fn draw_scanlines(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
-/// Dibuja el marco biselado empotrado de la pantalla CRT oscura.
-pub fn draw_crt_recess(painter: &egui::Painter, rect: Rect, p: &RetroPalette) {
-    painter.rect_filled(rect, 5.0, p.crt_bg);
-    // Sombra interior profunda (efecto vidrio CRT hundido en la carcasa)
+/// Dibuja la cavidad 3D biselada y el tubo de vidrio curvo de un monitor CRT retro.
+/// Devuelve el rectángulo del vidrio interior donde se renderiza el contenido.
+pub fn draw_crt_recess(painter: &egui::Painter, rect: Rect, p: &RetroPalette) -> Rect {
+    // Dimensiones de las paredes inclinadas del marco CRT
+    let chamfer_x = 13.0;
+    let chamfer_y = 11.0;
+    let glass_outer = Rect::from_min_max(
+        pos2(rect.left() + chamfer_x, rect.top() + chamfer_y),
+        pos2(rect.right() - chamfer_x, rect.bottom() - chamfer_y),
+    );
+
+    // 1. Sombra exterior sutil alrededor del marco del tubo
+    let top_wall_col = lerp_color(p.chassis_shadow, p.chassis_outline, 0.42);
+    let left_wall_col = lerp_color(p.chassis_bg, p.chassis_shadow, 0.78);
+    let right_wall_col = lerp_color(p.chassis_bg, p.chassis_shadow, 0.50);
+    let bottom_wall_col = lerp_color(p.chassis_bg, p.chassis_highlight, 0.42);
+
+    let tl = rect.left_top();
+    let tr = rect.right_top();
+    let br = rect.right_bottom();
+    let bl = rect.left_bottom();
+
+    let itl = glass_outer.left_top();
+    let itr = glass_outer.right_top();
+    let ibr = glass_outer.right_bottom();
+    let ibl = glass_outer.left_bottom();
+
+    // 2. Cuatro paredes trapezoidales biseladas hacia adentro (iluminación superior)
+    painter.add(egui::Shape::convex_polygon(
+        vec![tl, tr, itr, itl],
+        top_wall_col,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![tl, itl, ibl, bl],
+        left_wall_col,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![tr, br, ibr, itr],
+        right_wall_col,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![bl, ibl, ibr, br],
+        bottom_wall_col,
+        Stroke::NONE,
+    ));
+
+    // Aristas diagonales en las 4 esquinas para acentuar la profundidad 3D del molde
+    let crease = Stroke::new(1.0, lerp_color(p.chassis_shadow, p.chassis_outline, 0.35));
+    painter.line_segment([tl, itl], crease);
+    painter.line_segment([tr, itr], crease);
+    painter.line_segment([bl, ibl], Stroke::new(1.0, p.chassis_shadow));
+    painter.line_segment([br, ibr], Stroke::new(1.0, p.chassis_shadow));
+
+    // Labio exterior del hueco CRT (sombra superior/izq + brillo inferior/der)
     painter.rect_stroke(
         rect,
-        5.0,
-        Stroke::new(2.5, p.chassis_outline),
+        4.0,
+        Stroke::new(1.5, lerp_color(p.chassis_shadow, p.chassis_outline, 0.45)),
+        StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [pos2(bl.x + 2.0, bl.y + 0.5), pos2(br.x - 2.0, br.y + 0.5)],
+        Stroke::new(1.5, p.chassis_highlight),
+    );
+    painter.line_segment(
+        [pos2(tr.x + 0.5, tr.y + 2.0), pos2(br.x + 0.5, br.y - 2.0)],
+        Stroke::new(1.2, lerp_color(p.chassis_bg, p.chassis_highlight, 0.65)),
+    );
+
+    // 3. Tubo de vidrio CRT curvo empotrado
+    let glass_radius = 12.0;
+    // Marco negro profundo del tubo (borde del vidrio)
+    painter.rect_filled(glass_outer, glass_radius, p.chassis_outline);
+    let glass_inner = glass_outer.shrink(2.5);
+    painter.rect_filled(glass_inner, glass_radius - 1.5, p.crt_bg);
+
+    // Viñeta interior sutil (sensación de curvatura del fósforo CRT)
+    painter.rect_stroke(
+        glass_inner,
+        glass_radius - 1.5,
+        Stroke::new(3.5, Color32::from_rgba_unmultiplied(0, 0, 0, 125)),
         StrokeKind::Inside,
     );
     painter.rect_stroke(
-        rect.shrink(2.5),
-        4.0,
-        Stroke::new(2.0, p.crt_recess),
+        glass_inner.shrink(2.5),
+        glass_radius - 3.5,
+        Stroke::new(2.0, Color32::from_rgba_unmultiplied(0, 0, 0, 55)),
         StrokeKind::Inside,
     );
+
+    // Reflejo cristalino muy sutil en el borde superior del vidrio CRT
+    let gloss_y = glass_inner.top() + 3.0;
+    painter.line_segment(
+        [
+            pos2(glass_inner.left() + 18.0, gloss_y),
+            pos2(glass_inner.right() - 18.0, gloss_y),
+        ],
+        Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
+    );
+
+    glass_inner
 }
 
 /// Íconos vectoriales retro 14×14 para identificar visualmente cada tarjeta de sección.
@@ -360,46 +533,103 @@ pub fn retro_checkbox(ui: &mut egui::Ui, p: &RetroPalette, value: &mut bool, lab
     resp
 }
 
-/// Botón pestaña físico en el bisel superior de la carcasa CRT (`[L1] AJUSTES`, `[R1] CLIPS`).
-pub fn hardware_tab_button(
+/// Selector doble empotrado en el chasis superior estilo interruptor rocker CRT:
+/// `[ AJUSTES ]  |  • [ CLIPS & DECK (N) ]`.
+/// Devuelve `(settings_clicked, clips_clicked)`.
+pub fn draw_hardware_tab_rocker(
     ui: &mut egui::Ui,
     p: &RetroPalette,
-    active: bool,
-    shoulder: &str,
-    label: &str,
-) -> Response {
-    let text = format!("[{shoulder}] {label}");
-    let width = (text.chars().count() as f32 * 7.6 + 28.0).max(116.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
-    let painter = ui.painter();
+    settings_active: bool,
+    clips_count: usize,
+) -> (bool, bool) {
+    let left_lbl = "[ AJUSTES ]";
+    let right_lbl = format!("[ CLIPS & DECK ({clips_count}) ]");
+    let w_left = 114.0;
+    let w_right = (right_lbl.chars().count() as f32 * 7.2 + 30.0).max(168.0);
+    let height = 32.0;
+    let pad = 3.0;
+    let total_w = w_left + w_right + pad * 2.0 + 2.0;
 
+    let (outer, _) = ui.allocate_exact_size(vec2(total_w, height), Sense::hover());
+    let left_rect = Rect::from_min_size(
+        pos2(outer.left() + pad, outer.top() + pad),
+        vec2(w_left, height - pad * 2.0),
+    );
+    let right_rect = Rect::from_min_size(
+        pos2(left_rect.right() + 2.0, outer.top() + pad),
+        vec2(w_right, height - pad * 2.0),
+    );
+
+    let resp_left = ui.interact(
+        left_rect,
+        ui.scope_id().with("tab_settings_rocker"),
+        Sense::click(),
+    );
+    let resp_right = ui.interact(
+        right_rect,
+        ui.scope_id().with("tab_clips_rocker"),
+        Sense::click(),
+    );
+
+    let painter = ui.painter();
+    // Bahía empotrada oscura que aloja ambos interruptores
+    draw_recessed_bay(painter, outer, p, 4.0);
+
+    draw_rocker_half(
+        painter,
+        left_rect,
+        p,
+        settings_active,
+        resp_left.hovered(),
+        left_lbl,
+    );
+    draw_rocker_half(
+        painter,
+        right_rect,
+        p,
+        !settings_active,
+        resp_right.hovered(),
+        &right_lbl,
+    );
+
+    (resp_left.clicked(), resp_right.clicked())
+}
+
+fn draw_rocker_half(
+    painter: &egui::Painter,
+    rect: Rect,
+    p: &RetroPalette,
+    active: bool,
+    hovered: bool,
+    label: &str,
+) {
     if active {
-        // Pestaña activa empotrada oscura con LED fósforo encendido
-        painter.rect_filled(rect, 3.0, p.crt_bg);
-        painter.rect_stroke(rect, 3.0, Stroke::new(1.5, p.chassis_outline), StrokeKind::Inside);
+        // Pestaña activa: visor fósforo iluminado con LED encendido
+        painter.rect_filled(rect, 2.5, p.crt_bg);
         painter.rect_stroke(
-            rect.shrink(1.5),
-            2.0,
-            Stroke::new(1.0, p.accent),
+            rect,
+            2.5,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(p.accent.r(), p.accent.g(), p.accent.b(), 150)),
             StrokeKind::Inside,
         );
         draw_status_led(
             painter,
-            pos2(rect.left() + 11.0, rect.center().y),
-            3.2,
+            pos2(rect.left() + 10.0, rect.center().y),
+            2.8,
             p.accent_bright,
             true,
-            0.0,
+            0.2,
         );
         painter.text(
             pos2(rect.center().x + 5.0, rect.center().y),
             Align2::CENTER_CENTER,
-            text,
-            FontId::monospace(12.0),
+            label,
+            FontId::monospace(11.5),
             p.accent_bright,
         );
     } else {
-        let bg = if resp.hovered() {
+        // Pestaña inactiva: tecla física elevada del color del chasis
+        let bg = if hovered {
             p.chassis_btn_hover
         } else {
             p.chassis_btn_bg
@@ -411,21 +641,106 @@ pub fn hardware_tab_button(
             p.chassis_highlight,
             p.chassis_shadow,
             p.chassis_outline,
-            3.0,
+            2.5,
         );
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            text,
-            FontId::monospace(12.0),
+            label,
+            FontId::monospace(11.5),
             p.chassis_text,
         );
     }
+}
 
+/// Dibuja un LED hardware de encendido montado en un aro/zócalo circular empotrado.
+pub fn draw_power_led_socket(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    lit: bool,
+    pulse_01: f32,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+    let painter = ui.painter();
+    let c = rect.center();
+    // Zócalo hundido en el chasis
+    painter.circle_filled(c, 7.2, lerp_color(p.chassis_shadow, p.chassis_outline, 0.35));
+    painter.circle_stroke(c, 7.2, Stroke::new(1.0, p.chassis_highlight));
+    draw_status_led(
+        painter,
+        c,
+        4.6,
+        if lit { p.led_green } else { p.led_red },
+        lit,
+        pulse_01,
+    );
     resp
 }
 
-/// Botón físico táctil del bisel hardware (ej. `[ \ ] CLIP` en rojo o `REC` en crema/oscuro).
+/// Dibuja doble rejilla horizontal de parlante/ventilación CRT (2 columnas de 4 ranuras profundas).
+pub fn draw_dual_vent_grille(ui: &mut egui::Ui, p: &RetroPalette, total_width: f32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(total_width, height), Sense::hover());
+    let painter = ui.painter();
+    let col_gap = 10.0;
+    let col_w = ((rect.width() - col_gap) * 0.5).max(24.0);
+    let rows = 4;
+    let step = height / (rows as f32 + 0.6);
+    let groove_col = lerp_color(p.chassis_shadow, p.chassis_outline, 0.55);
+
+    for col in 0..2 {
+        let x0 = rect.left() + col as f32 * (col_w + col_gap);
+        let x1 = x0 + col_w;
+        for i in 0..rows {
+            let y = rect.top() + 3.0 + i as f32 * step;
+            let slot_rect = Rect::from_min_max(pos2(x0, y), pos2(x1, y + 2.4));
+            painter.rect_filled(slot_rect, 1.0, groove_col);
+            painter.line_segment(
+                [pos2(x0 + 0.5, y + 3.0), pos2(x1 - 0.5, y + 3.0)],
+                Stroke::new(1.0, p.chassis_highlight),
+            );
+        }
+    }
+}
+
+/// Placa de estado hardware moldeada en el chasis inferior derecho (LED + estado GPU/encoder).
+pub fn draw_hardware_status_plate(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    daemon_running: bool,
+    label: &str,
+) {
+    let width = (label.chars().count() as f32 * 6.8 + 32.0).clamp(160.0, 260.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
+    let painter = ui.painter();
+
+    // Placa biselada clara del color del chasis (como el prototipo CRT)
+    draw_beveled_box(
+        painter,
+        rect,
+        p.chassis_btn_bg,
+        p.chassis_highlight,
+        p.chassis_shadow,
+        lerp_color(p.chassis_shadow, p.chassis_outline, 0.65),
+        3.0,
+    );
+    draw_status_led(
+        painter,
+        pos2(rect.left() + 13.0, rect.center().y),
+        4.2,
+        if daemon_running { p.led_green } else { p.led_red },
+        true,
+        0.2,
+    );
+    painter.text(
+        pos2(rect.left() + 24.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::monospace(10.8),
+        p.chassis_text,
+    );
+}
+
+/// Botón físico táctil del bisel hardware (ej. `[ \ ] GUARDAR CLIP` en rojo o `REC`/`PAUSA`).
 pub fn hardware_action_button(
     ui: &mut egui::Ui,
     p: &RetroPalette,
@@ -434,7 +749,7 @@ pub fn hardware_action_button(
     text_color: Color32,
     height: f32,
 ) -> Response {
-    let width = (label.chars().count() as f32 * 7.5 + 22.0).max(74.0);
+    let width = (label.chars().count() as f32 * 7.4 + 20.0).max(34.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     let painter = ui.painter();
 
@@ -450,15 +765,15 @@ pub fn hardware_action_button(
         fill
     };
 
-    let hi = Color32::from_rgba_unmultiplied(255, 255, 255, 70);
-    let sh = Color32::from_rgba_unmultiplied(0, 0, 0, 90);
+    let hi = Color32::from_rgba_unmultiplied(255, 255, 255, 80);
+    let sh = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
     draw_beveled_box(painter, rect, bg, hi, sh, p.chassis_outline, 3.0);
 
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::monospace(11.8),
+        FontId::monospace(11.5),
         text_color,
     );
 
@@ -492,25 +807,6 @@ pub fn draw_status_led(
         radius,
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
     );
-}
-
-/// Dibuja las clásicas rejillas de ventilación de un monitor CRT en el bisel inferior.
-pub fn draw_vent_grille(ui: &mut egui::Ui, p: &RetroPalette, width: f32, height: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-    let painter = ui.painter();
-    let rows = 4;
-    let gap = height / (rows as f32 + 1.0);
-    for i in 1..=rows {
-        let y = rect.top() + gap * i as f32;
-        painter.line_segment(
-            [pos2(rect.left(), y), pos2(rect.right(), y)],
-            Stroke::new(2.0, p.chassis_shadow),
-        );
-        painter.line_segment(
-            [pos2(rect.left(), y + 1.5), pos2(rect.right(), y + 1.5)],
-            Stroke::new(1.0, p.chassis_highlight),
-        );
-    }
 }
 
 /// Medidor VU LED segmentado retro (24 bloques continuos verde → ámbar → rojo).
@@ -566,7 +862,7 @@ pub fn draw_led_vu_meter(
     resp.on_hover_text(format!("{tooltip}: {:.0}%", clamped * 100.0));
 }
 
-/// Tira LCD empotrada en el bisel inferior con mini-VU en vivo de Audio y Micrófono.
+/// Tira LCD empotrada en la base central del chasis con mini-VU en vivo de Audio y Micrófono.
 pub fn draw_mini_bezel_vu(
     ui: &mut egui::Ui,
     p: &RetroPalette,
@@ -574,45 +870,39 @@ pub fn draw_mini_bezel_vu(
     mic_lvl: f32,
     mic_enabled: bool,
 ) {
-    let width = 236.0;
-    let height = 24.0;
+    let width = 266.0;
+    let height = 26.0;
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let painter = ui.painter();
 
-    painter.rect_filled(rect, 3.0, p.crt_recess);
-    painter.rect_stroke(
-        rect,
-        3.0,
-        Stroke::new(1.3, p.chassis_outline),
-        StrokeKind::Inside,
-    );
+    draw_recessed_bay(painter, rect, p, 3.5);
 
     let y_mid = rect.center().y;
     painter.text(
-        pos2(rect.left() + 8.0, y_mid),
+        pos2(rect.left() + 10.0, y_mid),
         Align2::LEFT_CENTER,
-        "AUD",
-        FontId::monospace(10.0),
-        p.crt_muted,
+        "AUDIO",
+        FontId::monospace(10.5),
+        p.crt_text,
     );
     draw_mini_led_strip(
         painter,
-        Rect::from_min_size(pos2(rect.left() + 34.0, rect.top() + 6.0), vec2(74.0, 12.0)),
+        Rect::from_min_size(pos2(rect.left() + 50.0, rect.top() + 7.0), vec2(78.0, 12.0)),
         p,
         game_lvl,
         10,
     );
 
     painter.text(
-        pos2(rect.left() + 120.0, y_mid),
+        pos2(rect.left() + 140.0, y_mid),
         Align2::LEFT_CENTER,
         if mic_enabled { "MIC" } else { "OFF" },
-        FontId::monospace(10.0),
-        if mic_enabled { p.crt_muted } else { p.danger },
+        FontId::monospace(10.5),
+        if mic_enabled { p.crt_text } else { p.danger },
     );
     draw_mini_led_strip(
         painter,
-        Rect::from_min_size(pos2(rect.left() + 148.0, rect.top() + 6.0), vec2(74.0, 12.0)),
+        Rect::from_min_size(pos2(rect.left() + 170.0, rect.top() + 7.0), vec2(84.0, 12.0)),
         p,
         if mic_enabled { mic_lvl } else { 0.0 },
         10,
