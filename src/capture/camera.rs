@@ -115,6 +115,7 @@ pub struct CameraCapture {
     alive: Arc<AtomicBool>,
     mirror: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CameraFrame>>>,
+    recycle_buf: Arc<Mutex<Option<Vec<u8>>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -150,11 +151,13 @@ impl CameraCapture {
         let alive = Arc::new(AtomicBool::new(true));
         let mirror_flag = Arc::new(AtomicBool::new(mirror));
         let latest_frame: Arc<Mutex<Option<CameraFrame>>> = Arc::new(Mutex::new(None));
+        let recycle_buf: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
         let closed_bg = Arc::clone(&closed);
         let alive_bg = Arc::clone(&alive);
         let mirror_bg = Arc::clone(&mirror_flag);
         let latest_bg = Arc::clone(&latest_frame);
+        let recycle_bg = Arc::clone(&recycle_buf);
         let target_link = target.symbolic_link.clone();
         let target_name = target.friendly_name.clone();
 
@@ -183,6 +186,7 @@ impl CameraCapture {
                     alive_bg.clone(),
                     mirror_bg,
                     latest_bg,
+                    recycle_bg,
                 );
 
                 alive_bg.store(false, Ordering::Release);
@@ -209,6 +213,7 @@ impl CameraCapture {
                     alive,
                     mirror: mirror_flag,
                     latest_frame,
+                    recycle_buf,
                     worker: Some(worker),
                 })
             }
@@ -230,6 +235,14 @@ impl CameraCapture {
         self.latest_frame.lock().ok()?.take()
     }
 
+    /// Devuelve un buffer `BGRA8` ya subido a GPU para reutilizarlo en el siguiente frame
+    /// (evita asignaciones repetidas de varios MB en el heap).
+    pub fn recycle_buffer(&self, buf: Vec<u8>) {
+        if let Ok(mut slot) = self.recycle_buf.lock() {
+            *slot = Some(buf);
+        }
+    }
+
     /// Cambia el modo espejo horizontal en caliente sin reiniciar la cámara.
     pub fn set_mirror(&self, mirror: bool) {
         self.mirror.store(mirror, Ordering::Relaxed);
@@ -243,6 +256,9 @@ impl CameraCapture {
     pub fn stop(&mut self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
             if let Ok(mut slot) = self.latest_frame.lock() {
+                *slot = None;
+            }
+            if let Ok(mut slot) = self.recycle_buf.lock() {
                 *slot = None;
             }
             if let Some(handle) = self.worker.take() {
@@ -269,6 +285,7 @@ fn camera_worker_loop(
     alive: Arc<AtomicBool>,
     mirror: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CameraFrame>>>,
+    recycle_buf: Arc<Mutex<Option<Vec<u8>>>>,
 ) {
     let setup = open_camera_reader(target_link, target_name, preferred_preset);
     let (source, reader, mut width, mut height, mut stride) = match setup {
@@ -346,16 +363,23 @@ fn camera_worker_loop(
             continue;
         }
 
-        let mut bgra = Vec::new();
+        let mut bgra = recycle_buf
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_default();
         if !ptr.is_null() && cur_len > 0 && width >= 64 && height >= 48 {
             let src = unsafe { std::slice::from_raw_parts(ptr, cur_len as usize) };
-            bgra = copy_rgb32_to_bgra(
+            copy_rgb32_to_bgra_into(
+                &mut bgra,
                 src,
                 width,
                 height,
                 stride,
                 mirror.load(Ordering::Relaxed),
             );
+        } else {
+            bgra.clear();
         }
 
         unsafe {
@@ -364,12 +388,18 @@ fn camera_worker_loop(
 
         if !bgra.is_empty() {
             if let Ok(mut slot) = latest_frame.lock() {
-                *slot = Some(CameraFrame {
+                if let Some(old) = slot.replace(CameraFrame {
                     width,
                     height,
                     bgra,
-                });
+                }) {
+                    if let Ok(mut rec) = recycle_buf.lock() {
+                        *rec = Some(old.bgra);
+                    }
+                }
             }
+        } else if let Ok(mut rec) = recycle_buf.lock() {
+            *rec = Some(bgra);
         }
     }
 
@@ -735,6 +765,7 @@ fn get_activate_string(activate: &IMFActivate, key: &GUID) -> Option<String> {
 
 /// Copia un frame `MFVideoFormat_RGB32` (BGRX) a un buffer `BGRA8` contiguo con alfa opaco (`0xFF`),
 /// corrigiendo strides negativos (imágenes invertidas verticalmente) y aplicando espejo horizontal si se solicita.
+#[cfg(test)]
 pub fn copy_rgb32_to_bgra(
     src: &[u8],
     width: u32,
@@ -742,6 +773,20 @@ pub fn copy_rgb32_to_bgra(
     default_stride: i32,
     mirror_x: bool,
 ) -> Vec<u8> {
+    let mut dst = Vec::new();
+    copy_rgb32_to_bgra_into(&mut dst, src, width, height, default_stride, mirror_x);
+    dst
+}
+
+/// Variante sin asignaciones por frame que reutiliza la capacidad de `dst`.
+pub fn copy_rgb32_to_bgra_into(
+    dst: &mut Vec<u8>,
+    src: &[u8],
+    width: u32,
+    height: u32,
+    default_stride: i32,
+    mirror_x: bool,
+) {
     let w = width as usize;
     let h = height as usize;
     let row_bytes = w * 4;
@@ -749,10 +794,11 @@ pub fn copy_rgb32_to_bgra(
     let flip_y = default_stride < 0;
 
     if src.len() < row_stride.saturating_mul(h) || w == 0 || h == 0 {
-        return Vec::new();
+        dst.clear();
+        return;
     }
 
-    let mut dst = vec![0u8; row_bytes * h];
+    dst.resize(row_bytes * h, 0);
     for y in 0..h {
         let src_y = if flip_y { h - 1 - y } else { y };
         let src_row = &src[src_y * row_stride..src_y * row_stride + row_bytes];
@@ -775,8 +821,6 @@ pub fn copy_rgb32_to_bgra(
             }
         }
     }
-
-    dst
 }
 
 #[inline]

@@ -8,8 +8,9 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
@@ -196,8 +197,8 @@ struct ActiveSession {
     /// Fuente opcional de webcam (solo abierta cuando `camera_cfg.enabled == true`).
     camera: Option<CameraCapture>,
     camera_cfg: CameraConfig,
-    /// Textura BGRA8 reutilizable en VRAM para la webcam (`D3D11_USAGE_DEFAULT`).
-    cam_gpu_tex: Option<(ID3D11Texture2D, u32, u32)>,
+    /// Textura GPU + anillo staging (2 slots) para subir frames de webcam sin renombrado interno del driver.
+    cam_gpu_upload: Option<CameraGpuUpload>,
     /// Último frame del juego/monitor retenido para recomponer cámara incluso en pantallas estáticas.
     last_game_frame: Option<CapturedFrame>,
     /// Fuerza recomposición NV12 al cambiar esquina/tamaño/espejo/estirado 4:3 en caliente.
@@ -318,7 +319,7 @@ impl ActiveSession {
             audio,
             camera,
             camera_cfg,
-            cam_gpu_tex: None,
+            cam_gpu_upload: None,
             last_game_frame: None,
             layout_dirty: false,
             stretch_aspect_ratio: cfg.stretch_aspect_ratio,
@@ -369,7 +370,7 @@ impl ActiveSession {
             if self.camera.take().is_some() {
                 info!("Cámara desactivada en vivo (LED apagado, 0% CPU/GPU)");
             }
-            self.cam_gpu_tex = None;
+            self.cam_gpu_upload = None;
             self.layout_dirty = true;
         } else {
             let needs_reopen = self.camera.is_none()
@@ -379,7 +380,7 @@ impl ActiveSession {
 
             if needs_reopen {
                 self.camera = None;
-                self.cam_gpu_tex = None;
+                self.cam_gpu_upload = None;
                 match CameraCapture::start(
                     new_cam.device_id.as_deref(),
                     new_cam.mirror,
@@ -410,7 +411,7 @@ impl ActiveSession {
         if self.camera.as_ref().is_some_and(|c| !c.is_alive()) {
             warn!("La cámara se desconectó; continuando grabación sin superposición de cámara");
             self.camera = None;
-            self.cam_gpu_tex = None;
+            self.cam_gpu_upload = None;
             return true;
         }
 
@@ -418,7 +419,14 @@ impl ActiveSession {
             return false;
         };
 
-        match upload_camera_frame_to_gpu(&self.d3d, &mut self.cam_gpu_tex, &fresh_cam) {
+        let upload_res = upload_camera_frame_to_gpu(&self.d3d, &mut self.cam_gpu_upload, &fresh_cam);
+
+        // Reciclar el buffer CPU al hilo de la cámara para mantener 0 asignaciones por frame.
+        if let Some(cam) = &self.camera {
+            cam.recycle_buffer(fresh_cam.bgra);
+        }
+
+        match upload_res {
             Ok(()) => true,
             Err(err) => {
                 warn!("No se pudo subir frame de webcam a VRAM ({err:#})");
@@ -520,14 +528,16 @@ impl ActiveSession {
 
         if self.is_paused() {
             if let Some(cam) = &self.camera {
-                let _ = cam.take_latest();
+                if let Some(stale) = cam.take_latest() {
+                    cam.recycle_buffer(stale.bgra);
+                }
             }
             if let Some(cap) = &self.capture {
                 if let Some(fresh) = cap.take_latest() {
                     self.last_wgc_frame_at = Instant::now();
                     let cam_overlay = make_camera_overlay(
                         self.camera.is_some(),
-                        self.cam_gpu_tex.as_ref(),
+                        self.cam_gpu_upload.as_ref(),
                         &self.camera_cfg,
                     );
                     if let Ok(nv12) = self.converter.convert_with_camera(
@@ -588,7 +598,7 @@ impl ActiveSession {
             if let Some(game) = self.last_game_frame.as_ref() {
                 let cam_overlay = make_camera_overlay(
                     self.camera.is_some(),
-                    self.cam_gpu_tex.as_ref(),
+                    self.cam_gpu_upload.as_ref(),
                     &self.camera_cfg,
                 );
                 match self.converter.convert_with_camera(
@@ -1229,37 +1239,48 @@ fn publish_status(
     }
 }
 
+struct CameraGpuUpload {
+    gpu_tex: ID3D11Texture2D,
+    staging_ring: [ID3D11Texture2D; 2],
+    next_staging: usize,
+    width: u32,
+    height: u32,
+}
+
 fn make_camera_overlay<'a>(
     camera_active: bool,
-    cam_gpu_tex: Option<&'a (ID3D11Texture2D, u32, u32)>,
+    cam_upload: Option<&'a CameraGpuUpload>,
     cfg: &CameraConfig,
 ) -> Option<CameraOverlay<'a>> {
     if !camera_active {
         return None;
     }
-    let (tex, w, h) = cam_gpu_tex?;
+    let up = cam_upload?;
     Some(CameraOverlay {
-        texture: tex,
-        width: *w,
-        height: *h,
+        texture: &up.gpu_tex,
+        width: up.width,
+        height: up.height,
         corner: cfg.corner,
         size: cfg.size,
     })
 }
 
-/// Sube un frame `BGRA8` de la webcam a una textura `D3D11_USAGE_DEFAULT` reutilizable en VRAM
-/// (compatible con `ID3D11VideoDevice::CreateVideoProcessorInputView` en NVIDIA, AMD e Intel).
+/// Sube un frame `BGRA8` de la webcam a VRAM usando un anillo de 2 texturas `D3D11_USAGE_STAGING`
+/// + `Map(WRITE)` + `CopyResource` hacia una textura `D3D11_USAGE_DEFAULT` (`RENDER_TARGET | SHADER_RESOURCE`).
+///
+/// Evita el renombrado interno de buffers de `UpdateSubresource` en drivers AMD/NVIDIA
+/// (reduce el consumo de RAM del proceso en ~200–300 MB cuando la cámara está activa).
 fn upload_camera_frame_to_gpu(
     d3d: &SharedD3DDevice,
-    slot: &mut Option<(ID3D11Texture2D, u32, u32)>,
+    slot: &mut Option<CameraGpuUpload>,
     frame: &crate::capture::camera::CameraFrame,
 ) -> Result<()> {
     let needs_new = slot
         .as_ref()
-        .is_none_or(|(_, w, h)| *w != frame.width || *h != frame.height);
+        .is_none_or(|up| up.width != frame.width || up.height != frame.height);
 
     if needs_new {
-        let desc = D3D11_TEXTURE2D_DESC {
+        let gpu_desc = D3D11_TEXTURE2D_DESC {
             Width: frame.width,
             Height: frame.height,
             MipLevels: 1,
@@ -1274,23 +1295,80 @@ fn upload_camera_frame_to_gpu(
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        let mut tex = None;
-        unsafe { d3d.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
-            .context("CreateTexture2D (webcam BGRA8) falló")?;
-        let tex = tex.context("CreateTexture2D (webcam) devolvió None")?;
-        *slot = Some((tex, frame.width, frame.height));
+        let mut gpu_tex = None;
+        unsafe { d3d.device.CreateTexture2D(&gpu_desc, None, Some(&mut gpu_tex)) }
+            .context("CreateTexture2D (webcam GPU BGRA8) falló")?;
+        let gpu_tex = gpu_tex.context("CreateTexture2D (webcam GPU) devolvió None")?;
+
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: frame.width,
+            Height: frame.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut st0 = None;
+        let mut st1 = None;
+        unsafe { d3d.device.CreateTexture2D(&staging_desc, None, Some(&mut st0)) }
+            .context("CreateTexture2D (webcam staging 0) falló")?;
+        unsafe { d3d.device.CreateTexture2D(&staging_desc, None, Some(&mut st1)) }
+            .context("CreateTexture2D (webcam staging 1) falló")?;
+
+        *slot = Some(CameraGpuUpload {
+            gpu_tex,
+            staging_ring: [
+                st0.context("staging 0 None")?,
+                st1.context("staging 1 None")?,
+            ],
+            next_staging: 0,
+            width: frame.width,
+            height: frame.height,
+        });
     }
 
-    if let Some((tex, _, _)) = slot.as_ref() {
+    if let Some(up) = slot.as_mut() {
+        let staging = &up.staging_ring[up.next_staging];
+        up.next_staging = (up.next_staging + 1) % up.staging_ring.len();
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
-            d3d.context.UpdateSubresource(
-                tex,
-                0,
-                None,
-                frame.bgra.as_ptr().cast(),
-                frame.width * 4,
-                0,
-            );
+            d3d.context
+                .Map(staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped))
+        }
+        .context("Map (webcam staging) falló")?;
+
+        let row_bytes = (frame.width as usize) * 4;
+        let dst_pitch = mapped.RowPitch as usize;
+        let h = frame.height as usize;
+
+        if !mapped.pData.is_null() && dst_pitch >= row_bytes && frame.bgra.len() >= row_bytes * h {
+            unsafe {
+                let dst_base = mapped.pData as *mut u8;
+                if dst_pitch == row_bytes {
+                    std::ptr::copy_nonoverlapping(frame.bgra.as_ptr(), dst_base, row_bytes * h);
+                } else {
+                    for y in 0..h {
+                        std::ptr::copy_nonoverlapping(
+                            frame.bgra.as_ptr().add(y * row_bytes),
+                            dst_base.add(y * dst_pitch),
+                            row_bytes,
+                        );
+                    }
+                }
+            }
+        }
+
+        unsafe {
+            d3d.context.Unmap(staging, 0);
+            d3d.context.CopyResource(&up.gpu_tex, staging);
         }
     }
 
