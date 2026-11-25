@@ -415,7 +415,9 @@ impl ActiveSession {
             if remaining <= 0 {
                 if remaining < -1_200_000 {
                     let elapsed = (now - self.qpc_origin_100ns - self.total_paused_100ns).max(0);
-                    self.frame_index = ((elapsed * fps) / 10_000_000) as u64;
+                    let resync = ((elapsed * fps) / 10_000_000) as u64;
+                    crate::perf::skipped(resync.saturating_sub(self.frame_index));
+                    self.frame_index = resync;
                 }
                 break;
             }
@@ -425,6 +427,8 @@ impl ActiveSession {
                 thread::yield_now();
             }
         }
+
+        let work_started = Instant::now();
 
         // 1. Tomar el frame más reciente del buzón WGC (si llegó uno nuevo desde el tick anterior).
         if let Some(cap) = &self.capture {
@@ -456,6 +460,7 @@ impl ActiveSession {
             self.qpc_origin_100ns = clock::now_100ns();
         }
 
+        crate::perf::tick(work_started.elapsed(), self.last_nv12.is_some());
         Ok(pause_changed)
     }
 }
@@ -872,6 +877,7 @@ fn handle_save_clip(
     event_tx: &Sender<EngineEvent>,
     telemetry: &Arc<Mutex<Option<TelemetryWriter>>>,
 ) {
+    let held_since = Instant::now();
     let Some(active) = session.as_mut() else {
         let msg = "No hay grabación activa en este momento.";
         record_and_publish_event(session, cfg, telemetry, msg, true);
@@ -947,6 +953,7 @@ fn handle_save_clip(
                 let _ = event_tx_clone.send(EngineEvent::ClipFailed(format!("{err:#}")));
             }
         });
+    crate::perf::save_held(held_since.elapsed());
 }
 
 fn recording_state_to_telemetry(state: &RecordingState) -> (TelemetryState, &str) {

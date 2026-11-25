@@ -13,6 +13,7 @@ mod game_detect;
 mod hotkey;
 mod ipc;
 mod muxer;
+mod perf;
 mod startup;
 mod tray;
 mod trimmer;
@@ -67,6 +68,8 @@ fn main() -> Result<()> {
         Some("--tray") => return run_daemon(false),
         // Prueba CLI automatizada: `bals --test [720p|1080p|2k] [30|60] [segundos] [--pid <PID>]`
         Some("--test") => return run_cli_test(&args[1..]),
+        // Autoevaluación del rendimiento: `bals --soak <minutos> <carpeta> [escenario|-] [segundos entre clips]`.
+        Some("--soak") => std::process::exit(perf::soak(&args[1..])),
         _ => {}
     }
 

@@ -35,6 +35,16 @@ Cliper de videojuegos ultra-liviano para **Windows 10/11**, escrito en **Rust** 
   ```powershell
   .\bals.exe --test 1080p 60 6
   ```
+- **Medir el rendimiento y buscar fugas (ej. 10 minutos, un clip por minuto, con Bals cerrado):**
+  ```powershell
+  .\bals.exe --soak 10 C:\bals-perf monitor 60 > C:\bals-perf.txt
+  ```
+  Graba el monitor con el motor real, guarda un clip cada 60 s y se mide cada segundo: CPU, RAM, VRAM, cada motor de la
+  GPU, handles, hilos, cuadros codificados y salteados, trabajo por tick y tiempos al guardar. Al terminar deja en la
+  carpeta `informe.md`, `informe.toml` (veredicto, avisos y fugas) y `perf.csv` (una muestra por segundo). No toca tu
+  `config.toml` ni tu carpeta de clips. Escenarios: `monitor`, `mic`, `cpu`, `30`, `ahorro`, `alta`, `sincursor`,
+  `juegos`, `720`, `1080`, `1440`. Con Claude Code, pídele "mide el rendimiento de Bals y busca fugas": usa la skill
+  `.claude/skills/rendimiento`.
 
 ## Configuración
 
