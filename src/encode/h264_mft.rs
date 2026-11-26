@@ -38,23 +38,33 @@ use crate::encode::{EncodedVideoPacket, annexb_contains_idr};
 /// Resumen de encoders de video H.264 disponibles en el sistema.
 #[derive(Debug, Clone, Default)]
 pub struct DetectedEncoders {
+    pub adapter_name: Option<String>,
     pub hw_name: Option<String>,
     pub hw_short: Option<String>,
     pub sw_name: Option<String>,
 }
 
-/// Enumera los encoders de video H.264 (Hardware GPU y Software CPU) en Media Foundation.
+/// Enumera los encoders de video H.264 (Hardware GPU y Software CPU) en Media Foundation,
+/// priorizando el encoder hardware que coincide con el adaptador DXGI activo (ej. NVIDIA NVENC
+/// en PCs con CPU AMD Ryzen con iGPU + GPU NVIDIA dedicada).
 pub fn detect_system_encoders() -> DetectedEncoders {
     let mut out = DetectedEncoders::default();
+    out.adapter_name = crate::d3d::primary_adapter_name();
+    let preferred_vendor = out.adapter_name.as_deref().and_then(vendor_token);
+
     if unsafe { MFStartup(MF_VERSION, 0) }.is_err() {
         return out;
     }
 
-    if let Some(hw) = first_enumerated_encoder_name(true) {
-        out.hw_short = Some(short_hw_label(&hw));
-        out.hw_name = Some(hw);
+    if let Ok(hw_candidates) = enumerate_mft_candidates(true, preferred_vendor) {
+        if let Some((_, hw)) = hw_candidates.into_iter().next() {
+            out.hw_short = Some(short_hw_label(&hw));
+            out.hw_name = Some(hw);
+        }
     }
-    out.sw_name = first_enumerated_encoder_name(false);
+    if let Ok(sw_candidates) = enumerate_mft_candidates(false, None) {
+        out.sw_name = sw_candidates.into_iter().next().map(|(_, name)| name);
+    }
 
     unsafe {
         let _ = MFShutdown();
@@ -77,60 +87,31 @@ fn short_hw_label(name: &str) -> String {
 
 fn vendor_token(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("nvidia") || lower.contains("nvenc") || lower.contains("geforce") || lower.contains("rtx") || lower.contains("gtx") {
+    if lower.contains("nvidia")
+        || lower.contains("nvenc")
+        || lower.contains("geforce")
+        || lower.contains("rtx")
+        || lower.contains("gtx")
+        || lower.contains("quadro")
+        || lower.contains("tesla")
+    {
         Some("nvidia")
-    } else if lower.contains("amd") || lower.contains("radeon") || lower.contains("amf") || lower.contains("vce") {
+    } else if lower.contains("amd")
+        || lower.contains("radeon")
+        || lower.contains("amf")
+        || lower.contains("vce")
+    {
         Some("amd")
-    } else if lower.contains("intel") || lower.contains("qsv") || lower.contains("arc") || lower.contains("uhd") || lower.contains("iris") {
+    } else if lower.contains("intel")
+        || lower.contains("qsv")
+        || lower.contains("arc")
+        || lower.contains("uhd")
+        || lower.contains("iris")
+    {
         Some("intel")
     } else {
         None
     }
-}
-
-fn first_enumerated_encoder_name(hardware: bool) -> Option<String> {
-    let output_info = MFT_REGISTER_TYPE_INFO {
-        guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
-    };
-    let flags = if hardware {
-        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
-    } else {
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER
-    };
-
-    let mut raw_activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-    let mut count = 0u32;
-    if unsafe {
-        MFTEnumEx(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            flags,
-            None,
-            Some(&output_info),
-            &mut raw_activates,
-            &mut count,
-        )
-    }
-    .is_err()
-        || count == 0
-        || raw_activates.is_null()
-    {
-        return None;
-    }
-
-    let mut found = None;
-    let slice = unsafe { std::slice::from_raw_parts_mut(raw_activates, count as usize) };
-    for slot in slice.iter_mut() {
-        if let Some(activate) = slot.take() {
-            if found.is_none() {
-                found = get_friendly_name(&activate);
-            }
-        }
-    }
-    unsafe {
-        CoTaskMemFree(Some(raw_activates as *const _));
-    }
-    found
 }
 
 /// Encoder de video H.264 por Hardware vía Windows Media Foundation
@@ -645,6 +626,12 @@ fn enumerate_mft_candidates(
         if let Some(want) = preferred_vendor {
             list.sort_by_key(|(_, name)| usize::from(vendor_token(name) != Some(want)));
         }
+        let names: Vec<&str> = list.iter().map(|(_, n)| n.as_str()).collect();
+        debug!(
+            preferred_vendor = ?preferred_vendor,
+            candidates = ?names,
+            "Encoders H.264 Hardware enumerados"
+        );
     }
 
     Ok(list)

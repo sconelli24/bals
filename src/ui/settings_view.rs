@@ -146,7 +146,14 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 .detected_encoders
                 .hw_name
                 .as_deref()
-                .map(|n| format!("Codificación H.264 por hardware en tu gráfica: {n} (con fallback seguro a CPU)"))
+                .map(|n| match app.detected_encoders.adapter_name.as_deref() {
+                    Some(adapter) => format!(
+                        "GPU activa: {adapter}\nEncoder H.264: {n} (con fallback seguro a CPU)"
+                    ),
+                    None => format!(
+                        "Codificación H.264 por hardware en tu gráfica: {n} (con fallback seguro a CPU)"
+                    ),
+                })
                 .unwrap_or_else(|| "No se detectó encoder H.264 por hardware en esta PC".to_string());
             let sw_hover = app
                 .detected_encoders
@@ -500,9 +507,9 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
             // Keycap limpia (sin corchetes `[ ]`) + botón único ASIGNAR TECLA
             ui.horizontal(|ui| {
                 let key_display = if app.listening_hotkey {
-                    "..."
+                    "...".to_string()
                 } else {
-                    app.cfg.save_clip_hotkey.as_str()
+                    crate::hotkey::display_hotkey(&app.cfg.save_clip_hotkey)
                 };
                 let (krect, _) = ui.allocate_exact_size(vec2(96.0, 28.0), Sense::hover());
                 let painter = ui.painter();
@@ -516,7 +523,7 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                 painter.text(
                     krect.center(),
                     Align2::CENTER_CENTER,
-                    key_display,
+                    &key_display,
                     FontId::monospace(13.0),
                     if app.listening_hotkey {
                         p.amber

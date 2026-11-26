@@ -9,7 +9,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, ID3D11Device, ID3D11DeviceContext,
     ID3D11Multithread,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIDevice, IDXGIFactory1,
+};
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 use tracing::{info, warn};
 
@@ -118,4 +120,30 @@ fn describe_adapter(dxgi_device: &IDXGIDevice) -> Option<String> {
         .position(|&c| c == 0)
         .unwrap_or(desc.Description.len());
     Some(String::from_utf16_lossy(&desc.Description[..len]))
+}
+
+/// Consulta el nombre del adaptador DXGI hardware principal (el mismo que elige
+/// `D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, ...)`) sin crear dispositivo D3D11 ni usar VRAM.
+pub fn primary_adapter_name() -> Option<String> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1().ok()? };
+    let mut idx = 0u32;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(idx) } {
+        idx += 1;
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+            continue;
+        }
+        let len = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..len]);
+        if !name.trim().is_empty() {
+            return Some(name);
+        }
+    }
+    None
 }

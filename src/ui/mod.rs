@@ -21,7 +21,7 @@ use crate::capture::{CameraDeviceInfo, MonitorInfo, list_cameras, list_monitors}
 use crate::config::{AppConfig, EncoderPreference, UiTheme};
 use crate::encode::h264_mft::{DetectedEncoders, detect_system_encoders};
 use crate::game_detect::{RunningApp, list_running_window_apps};
-use crate::hotkey::parse_hotkey;
+use crate::hotkey::{self, HotkeyCaptureEvent, display_hotkey, parse_hotkey};
 use crate::ipc::{self, EngineTelemetrySnapshot, TelemetryState};
 use crate::startup;
 use crate::trimmer::{
@@ -81,6 +81,7 @@ pub(crate) struct BalsUiApp {
     pub start_with_windows: bool,
     pub hotkey_error: Option<String>,
     pub listening_hotkey: bool,
+    hotkey_prev_keys: [bool; 256],
     pub show_exe_picker: bool,
     pub running_apps: Vec<RunningApp>,
     pub exe_picker_filter: String,
@@ -159,6 +160,7 @@ impl BalsUiApp {
             start_with_windows,
             hotkey_error: None,
             listening_hotkey: false,
+            hotkey_prev_keys: [false; 256],
             show_exe_picker: false,
             running_apps: Vec::new(),
             exe_picker_filter: String::new(),
@@ -212,6 +214,7 @@ impl BalsUiApp {
         }
         self.listening_hotkey = listening;
         if listening {
+            self.hotkey_prev_keys = hotkey::snapshot_key_states();
             ipc::notify_pause_hotkey();
         } else {
             ipc::notify_resume_hotkey();
@@ -603,35 +606,19 @@ impl BalsUiApp {
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        // Si estamos capturando una tecla nueva para el atajo global:
+        // Si estamos capturando una tecla nueva para el atajo global, usar el lector nativo Win32
+        // para soportar 100% de las teclas físicas (Numpad, OEM/ES/LatAm, Pause, ScrollLock, etc.).
         if self.listening_hotkey {
-            let captured = ctx.input(|i| {
-                for ev in &i.events {
-                    if let egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } = ev
-                    {
-                        if *key == egui::Key::Escape {
-                            return Some(None);
-                        }
-                        if let Some(spec) = egui_key_to_hotkey_spec(*key, *modifiers) {
-                            return Some(Some(spec));
-                        }
+            ctx.request_repaint_after(Duration::from_millis(16));
+            if ctx.input(|i| i.focused) {
+                if let Some(ev) = hotkey::poll_pressed_hotkey(&mut self.hotkey_prev_keys) {
+                    self.set_listening_hotkey(false);
+                    if let HotkeyCaptureEvent::Captured(spec) = ev {
+                        self.cfg.save_clip_hotkey = spec;
+                        self.hotkey_error = parse_hotkey(&self.cfg.save_clip_hotkey)
+                            .err()
+                            .map(|e| format!("{e}"));
                     }
-                }
-                None
-            });
-
-            if let Some(res) = captured {
-                self.set_listening_hotkey(false);
-                if let Some(spec) = res {
-                    self.cfg.save_clip_hotkey = spec;
-                    self.hotkey_error = parse_hotkey(&self.cfg.save_clip_hotkey)
-                        .err()
-                        .map(|e| format!("{e}"));
                 }
             }
             return;
@@ -842,8 +829,10 @@ impl eframe::App for BalsUiApp {
                                 });
 
                             if self.daemon_running {
-                                let clip_btn_lbl =
-                                    format!("[{}] GUARDAR CLIP", self.cfg.save_clip_hotkey);
+                                let clip_btn_lbl = format!(
+                                    "[{}] GUARDAR CLIP",
+                                    display_hotkey(&self.cfg.save_clip_hotkey)
+                                );
                                 if hardware_action_button(
                                     ui,
                                     &p,
@@ -1066,93 +1055,6 @@ fn draw_live_telemetry_lcd(
         FontId::monospace(11.0),
         if is_rec { p.led_red } else { p.crt_text },
     );
-}
-
-fn egui_key_to_hotkey_spec(key: egui::Key, mods: egui::Modifiers) -> Option<String> {
-    let base = match key {
-        egui::Key::F1 => "F1",
-        egui::Key::F2 => "F2",
-        egui::Key::F3 => "F3",
-        egui::Key::F4 => "F4",
-        egui::Key::F5 => "F5",
-        egui::Key::F6 => "F6",
-        egui::Key::F7 => "F7",
-        egui::Key::F8 => "F8",
-        egui::Key::F9 => "F9",
-        egui::Key::F10 => "F10",
-        egui::Key::F11 => "F11",
-        egui::Key::F12 => "F12",
-        egui::Key::F13 => "F13",
-        egui::Key::F14 => "F14",
-        egui::Key::F15 => "F15",
-        egui::Key::F16 => "F16",
-        egui::Key::F17 => "F17",
-        egui::Key::F18 => "F18",
-        egui::Key::F19 => "F19",
-        egui::Key::F20 => "F20",
-        egui::Key::Backslash => "\\",
-        egui::Key::Slash => "/",
-        egui::Key::Minus => "-",
-        egui::Key::Equals => "=",
-        egui::Key::OpenBracket => "[",
-        egui::Key::CloseBracket => "]",
-        egui::Key::Backtick => "`",
-        egui::Key::Insert => "Insert",
-        egui::Key::Home => "Home",
-        egui::Key::End => "End",
-        egui::Key::PageUp => "PgUp",
-        egui::Key::PageDown => "PgDn",
-        egui::Key::A => "A",
-        egui::Key::B => "B",
-        egui::Key::C => "C",
-        egui::Key::D => "D",
-        egui::Key::E => "E",
-        egui::Key::F => "F",
-        egui::Key::G => "G",
-        egui::Key::H => "H",
-        egui::Key::I => "I",
-        egui::Key::J => "J",
-        egui::Key::K => "K",
-        egui::Key::L => "L",
-        egui::Key::M => "M",
-        egui::Key::N => "N",
-        egui::Key::O => "O",
-        egui::Key::P => "P",
-        egui::Key::Q => "Q",
-        egui::Key::R => "R",
-        egui::Key::S => "S",
-        egui::Key::T => "T",
-        egui::Key::U => "U",
-        egui::Key::V => "V",
-        egui::Key::W => "W",
-        egui::Key::X => "X",
-        egui::Key::Y => "Y",
-        egui::Key::Z => "Z",
-        egui::Key::Num0 => "0",
-        egui::Key::Num1 => "1",
-        egui::Key::Num2 => "2",
-        egui::Key::Num3 => "3",
-        egui::Key::Num4 => "4",
-        egui::Key::Num5 => "5",
-        egui::Key::Num6 => "6",
-        egui::Key::Num7 => "7",
-        egui::Key::Num8 => "8",
-        egui::Key::Num9 => "9",
-        _ => return None,
-    };
-
-    let mut parts: Vec<&str> = Vec::with_capacity(4);
-    if mods.ctrl {
-        parts.push("Ctrl");
-    }
-    if mods.alt {
-        parts.push("Alt");
-    }
-    if mods.shift {
-        parts.push("Shift");
-    }
-    parts.push(base);
-    Some(parts.join("+"))
 }
 
 fn scan_clips(dir: &Path) -> Vec<ClipEntry> {
