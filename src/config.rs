@@ -585,6 +585,14 @@ impl AppConfig {
         }
     }
 
+    /// Intenta leer y deserializar `config.toml` sin escribir ni generar logs si falla
+    /// (ideal para sincronización en vivo de la UI cuando el tray modifica la configuración).
+    pub fn try_load() -> Option<Self> {
+        let path = Self::config_path();
+        let raw = std::fs::read_to_string(&path).ok()?;
+        toml::from_str::<AppConfig>(&raw).ok()
+    }
+
     pub fn load_or_create() -> Self {
         let path = Self::config_path();
         if path.exists() {

@@ -87,11 +87,12 @@ pub(crate) struct BalsUiApp {
     pub exe_picker_filter: String,
     pub banner_msg: Option<(String, bool, Instant)>,
 
-    // Estado en vivo del daemon vía memoria compartida
+    // Estado en vivo del daemon vía memoria compartida y sincronización de config.toml
     pub daemon_running: bool,
     pub telemetry: Option<EngineTelemetrySnapshot>,
     pub last_telemetry_poll: Instant,
     pub last_clip_event_seq: u32,
+    last_config_stamp: Option<(SystemTime, u64)>,
 
     // Auto-updater, encoders detectados, monitores, cámaras conectadas y audio VU continuo
     pub detected_encoders: DetectedEncoders,
@@ -130,6 +131,7 @@ pub(crate) struct BalsUiApp {
 impl BalsUiApp {
     fn new(ctx: &egui::Context) -> Self {
         let mut cfg = AppConfig::load_or_create();
+        let last_config_stamp = read_config_stamp();
         let start_with_windows = startup::is_autostart_enabled();
         let clips = scan_clips(&cfg.clips_dir);
         let daemon_running = ipc::is_daemon_running();
@@ -169,6 +171,7 @@ impl BalsUiApp {
             telemetry,
             last_telemetry_poll: Instant::now(),
             last_clip_event_seq,
+            last_config_stamp,
             detected_encoders,
             monitors,
             cameras,
@@ -343,6 +346,7 @@ impl BalsUiApp {
 
         match self.cfg.save() {
             Ok(()) => {
+                self.last_config_stamp = read_config_stamp();
                 self.daemon_running = ipc::is_daemon_running();
                 if ipc::notify_reload_config() {
                     self.set_banner("CONFIG GUARDADA Y APLICADA EN VIVO.", false);
@@ -468,9 +472,31 @@ impl BalsUiApp {
     }
 
     fn poll_background_states(&mut self, ctx: &egui::Context) -> Option<String> {
-        // 1. Telemetría compartida daemon → UI cada 200 ms (0 I/O en disco).
+        // 1. Telemetría compartida daemon → UI cada 200 ms + recarga automática si el tray editó config.toml.
         if self.last_telemetry_poll.elapsed() >= Duration::from_millis(200) {
             self.last_telemetry_poll = Instant::now();
+
+            if !self.listening_hotkey {
+                let current_stamp = read_config_stamp();
+                if current_stamp != self.last_config_stamp {
+                    if let Some(reloaded) = AppConfig::try_load() {
+                        self.last_config_stamp = current_stamp;
+                        let clips_dir_changed = reloaded.clips_dir != self.cfg.clips_dir;
+                        let needs_monitors = reloaded.capture_mode
+                            == crate::config::CaptureMode::ManualMonitor
+                            && self.monitors.is_empty();
+                        self.cfg = reloaded;
+                        self.hotkey_error = None;
+                        if needs_monitors {
+                            self.refresh_monitors();
+                        }
+                        if clips_dir_changed {
+                            self.refresh_clips();
+                        }
+                    }
+                }
+            }
+
             self.daemon_running = ipc::is_daemon_running();
             if self.daemon_running {
                 if let Some(tel) = ipc::read_engine_telemetry() {
@@ -1055,6 +1081,12 @@ fn draw_live_telemetry_lcd(
         FontId::monospace(11.0),
         if is_rec { p.led_red } else { p.crt_text },
     );
+}
+
+fn read_config_stamp() -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(AppConfig::config_path()).ok()?;
+    let modified = meta.modified().ok()?;
+    Some((modified, meta.len()))
 }
 
 fn scan_clips(dir: &Path) -> Vec<ClipEntry> {
