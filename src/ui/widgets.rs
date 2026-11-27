@@ -3,6 +3,7 @@ use eframe::egui::{
     Vec2, pos2, vec2,
 };
 
+use crate::config::CameraCorner;
 use crate::ui::theme::RetroPalette;
 
 /// Dibuja una superficie táctil con bisel estilo hardware retro (luz arriba-izquierda, sombra abajo-derecha).
@@ -503,7 +504,7 @@ pub fn retro_pill(
     } else if resp.hovered() {
         p.accent
     } else {
-        p.crt_widget_hover
+        lerp_color(p.crt_widget_hover, p.crt_panel_border, 0.35)
     };
 
     let text_color = if selected {
@@ -528,7 +529,202 @@ pub fn retro_pill(
         text_color,
     );
 
-    resp
+    if ui.is_enabled() {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Botón principal de guardado con indicador vectorial nítido (tilde vectorial al estar guardado,
+/// punto ámbar cuando hay cambios pendientes).
+pub fn retro_save_button(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    dirty: bool,
+    min_size: Vec2,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(min_size, Sense::click());
+    let painter = ui.painter();
+
+    if dirty {
+        let bg = if resp.hovered() {
+            Color32::from_rgb(
+                p.amber.r().saturating_add(16),
+                p.amber.g().saturating_add(16),
+                p.amber.b().saturating_add(16),
+            )
+        } else {
+            p.amber
+        };
+        let glow = Color32::from_rgba_unmultiplied(p.amber.r(), p.amber.g(), p.amber.b(), 44);
+        painter.rect_filled(rect.expand(1.5), 4.0, glow);
+        painter.rect_filled(rect, 3.0, bg);
+        painter.rect_stroke(
+            rect,
+            3.0,
+            Stroke::new(1.4, p.crt_text),
+            StrokeKind::Inside,
+        );
+
+        let label = "GUARDAR CAMBIOS";
+        let text_w = label.chars().count() as f32 * 7.2;
+        let dot_r = 3.5;
+        let gap = 7.0;
+        let start_x = rect.center().x - (dot_r * 2.0 + gap + text_w) * 0.5;
+        let cy = rect.center().y;
+        painter.circle_filled(pos2(start_x + dot_r, cy), dot_r, p.accent_text);
+        painter.text(
+            pos2(start_x + dot_r * 2.0 + gap + text_w * 0.5, cy),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::monospace(12.0),
+            p.accent_text,
+        );
+    } else {
+        let bg = p.accent;
+        let glow = Color32::from_rgba_unmultiplied(p.accent.r(), p.accent.g(), p.accent.b(), 36);
+        painter.rect_filled(rect.expand(1.5), 4.0, glow);
+        painter.rect_filled(rect, 3.0, bg);
+        painter.rect_stroke(
+            rect,
+            3.0,
+            Stroke::new(1.2, p.accent_bright),
+            StrokeKind::Inside,
+        );
+
+        let label = "GUARDADO";
+        let text_w = label.chars().count() as f32 * 7.2;
+        let check_w = 11.0;
+        let gap = 6.0;
+        let start_x = rect.center().x - (text_w + gap + check_w) * 0.5;
+        let cy = rect.center().y;
+
+        painter.text(
+            pos2(start_x + text_w * 0.5, cy),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::monospace(12.0),
+            p.accent_text,
+        );
+
+        // Tilde vectorial nítida (evita depender de glifos Unicode en la fuente monoespaciada)
+        let cx = start_x + text_w + gap;
+        let stroke = Stroke::new(2.0, p.accent_text);
+        painter.line_segment([pos2(cx, cy + 0.5), pos2(cx + 3.5, cy + 4.0)], stroke);
+        painter.line_segment([pos2(cx + 3.5, cy + 4.0), pos2(cx + 10.5, cy - 4.0)], stroke);
+    }
+
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Botón píldora con triángulo Play vectorial nítido (sin depender de glifos Unicode de la fuente).
+pub fn retro_play_pill(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    label: &str,
+    min_size: Vec2,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(min_size, Sense::click());
+    let painter = ui.painter();
+
+    let bg = if resp.hovered() {
+        p.crt_widget_hover
+    } else {
+        p.crt_widget_bg
+    };
+    let border = if resp.hovered() {
+        p.accent
+    } else {
+        lerp_color(p.crt_widget_hover, p.crt_panel_border, 0.35)
+    };
+
+    painter.rect_filled(rect, 3.0, bg);
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.2, border), StrokeKind::Inside);
+
+    let text_w = label.chars().count() as f32 * 7.2;
+    let icon_w = 9.0;
+    let gap = 6.0;
+    let start_x = rect.center().x - (icon_w + gap + text_w) * 0.5;
+    let cy = rect.center().y;
+
+    let tri = vec![
+        pos2(start_x, cy - 5.0),
+        pos2(start_x + icon_w, cy),
+        pos2(start_x, cy + 5.0),
+    ];
+    painter.add(egui::Shape::convex_polygon(tri, p.accent_bright, Stroke::NONE));
+
+    painter.text(
+        pos2(start_x + icon_w + gap + text_w * 0.5, cy),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::monospace(12.0),
+        p.crt_text,
+    );
+
+    if ui.is_enabled() {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Selector visual compacto de esquina PiP de cámara (dibuja una mini pantalla 16:9 con la esquina marcada).
+pub fn draw_camera_corner_button(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    corner: CameraCorner,
+    selected: bool,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 22.0), Sense::click());
+    let painter = ui.painter();
+
+    let bg = if selected {
+        p.accent
+    } else if resp.hovered() {
+        p.crt_widget_hover
+    } else {
+        p.crt_widget_bg
+    };
+    let border = if selected {
+        p.accent_bright
+    } else if resp.hovered() {
+        p.accent
+    } else {
+        lerp_color(p.crt_widget_hover, p.crt_panel_border, 0.35)
+    };
+
+    if selected {
+        let glow = Color32::from_rgba_unmultiplied(p.accent.r(), p.accent.g(), p.accent.b(), 36);
+        painter.rect_filled(rect.expand(1.5), 4.0, glow);
+    }
+    painter.rect_filled(rect, 3.0, bg);
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.2, border), StrokeKind::Inside);
+
+    // Mini marco de monitor 16:9 interior + recuadro PiP en la esquina seleccionada
+    let frame_rect = rect.shrink2(vec2(5.0, 4.0));
+    let frame_col = if selected { p.accent_text } else { p.crt_muted };
+    painter.rect_stroke(frame_rect, 1.0, Stroke::new(1.0, frame_col), StrokeKind::Inside);
+
+    let pip_size = vec2(7.0, 5.0);
+    let pip_pos = match corner {
+        CameraCorner::TopLeft => pos2(frame_rect.left() + 1.5, frame_rect.top() + 1.5),
+        CameraCorner::TopRight => pos2(frame_rect.right() - pip_size.x - 1.5, frame_rect.top() + 1.5),
+        CameraCorner::BottomLeft => pos2(frame_rect.left() + 1.5, frame_rect.bottom() - pip_size.y - 1.5),
+        CameraCorner::BottomRight => pos2(
+            frame_rect.right() - pip_size.x - 1.5,
+            frame_rect.bottom() - pip_size.y - 1.5,
+        ),
+    };
+    let pip_col = if selected { p.accent_text } else { p.accent };
+    painter.rect_filled(Rect::from_min_size(pip_pos, pip_size), 0.8, pip_col);
+
+    if ui.is_enabled() {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
 }
 
 /// Checkbox retro cuadrado con marca nítida estilo consola.
@@ -562,7 +758,12 @@ pub fn retro_checkbox(ui: &mut egui::Ui, p: &RetroPalette, value: &mut bool, lab
                 painter.rect_filled(rect.shrink(3.5), 1.0, p.accent);
             }
 
-            box_resp.union(lbl_resp)
+            let combined = box_resp.union(lbl_resp);
+            if ui.is_enabled() {
+                combined.on_hover_cursor(egui::CursorIcon::PointingHand)
+            } else {
+                combined
+            }
         })
         .inner;
 
@@ -599,16 +800,20 @@ pub fn draw_hardware_tab_rocker(
         vec2(w_right, height - pad * 2.0),
     );
 
-    let resp_left = ui.interact(
-        left_rect,
-        ui.scope_id().with("tab_settings_rocker"),
-        Sense::click(),
-    );
-    let resp_right = ui.interact(
-        right_rect,
-        ui.scope_id().with("tab_clips_rocker"),
-        Sense::click(),
-    );
+    let resp_left = ui
+        .interact(
+            left_rect,
+            ui.scope_id().with("tab_settings_rocker"),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp_right = ui
+        .interact(
+            right_rect,
+            ui.scope_id().with("tab_clips_rocker"),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
 
     let painter = ui.painter();
     // Bahía empotrada oscura que aloja ambos interruptores
@@ -779,44 +984,158 @@ pub fn draw_hardware_status_plate(
     );
 }
 
-/// Botón físico táctil del bisel hardware (ej. `[ \ ] GUARDAR CLIP` en rojo o `REC`/`PAUSA`).
-pub fn hardware_action_button(
+/// Botón físico táctil del bisel hardware (ej. `[ \ ] GUARDAR CLIP` en rojo) con soporte deshabilitado.
+pub fn hardware_action_button_enabled(
     ui: &mut egui::Ui,
     p: &RetroPalette,
     label: &str,
     fill: Color32,
     text_color: Color32,
     height: f32,
+    enabled: bool,
 ) -> Response {
     let width = (label.chars().count() as f32 * 7.4 + 20.0).max(34.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), sense);
     let painter = ui.painter();
 
-    let bg = if resp.is_pointer_button_down_on() {
-        fill.linear_multiply(0.85)
-    } else if resp.hovered() {
-        Color32::from_rgb(
-            fill.r().saturating_add(16),
-            fill.g().saturating_add(16),
-            fill.b().saturating_add(16),
+    let (bg, txt_col, hi, sh, outline) = if !enabled {
+        (
+            lerp_color(p.chassis_btn_bg, p.chassis_bg, 0.55),
+            p.chassis_muted,
+            lerp_color(p.chassis_highlight, p.chassis_bg, 0.5),
+            lerp_color(p.chassis_shadow, p.chassis_bg, 0.4),
+            lerp_color(p.chassis_shadow, p.chassis_outline, 0.45),
         )
     } else {
-        fill
+        let bg = if resp.is_pointer_button_down_on() {
+            fill.linear_multiply(0.85)
+        } else if resp.hovered() {
+            Color32::from_rgb(
+                fill.r().saturating_add(16),
+                fill.g().saturating_add(16),
+                fill.b().saturating_add(16),
+            )
+        } else {
+            fill
+        };
+        (
+            bg,
+            text_color,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 110),
+            p.chassis_outline,
+        )
     };
 
-    let hi = Color32::from_rgba_unmultiplied(255, 255, 255, 80);
-    let sh = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
-    draw_beveled_box(painter, rect, bg, hi, sh, p.chassis_outline, 3.0);
+    draw_beveled_box(painter, rect, bg, hi, sh, outline, 3.0);
 
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::monospace(11.5),
-        text_color,
+        txt_col,
     );
 
-    resp
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Botón físico dedicado de transporte para el Replay Buffer (Play / Pausa vectorial de alta nitidez).
+pub fn hardware_transport_button(
+    ui: &mut egui::Ui,
+    p: &RetroPalette,
+    is_recording: bool,
+    height: f32,
+) -> Response {
+    let width = 92.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    let painter = ui.painter();
+
+    let (base_fill, txt_col, hi, sh, border_col) = if is_recording {
+        (
+            p.amber,
+            p.accent_text,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 105),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 115),
+            p.chassis_outline,
+        )
+    } else {
+        (
+            p.chassis_btn_bg,
+            p.chassis_text,
+            p.chassis_highlight,
+            p.chassis_shadow,
+            if resp.hovered() {
+                p.accent
+            } else {
+                p.chassis_outline
+            },
+        )
+    };
+
+    let bg = if resp.is_pointer_button_down_on() {
+        base_fill.linear_multiply(0.86)
+    } else if resp.hovered() {
+        Color32::from_rgb(
+            base_fill.r().saturating_add(16),
+            base_fill.g().saturating_add(16),
+            base_fill.b().saturating_add(16),
+        )
+    } else {
+        base_fill
+    };
+
+    draw_beveled_box(painter, rect, bg, hi, sh, border_col, 3.0);
+
+    let cy = rect.center().y;
+    if is_recording {
+        // Dos barras verticales nítidas de Pausa
+        let bar_w = 3.5;
+        let bar_h = 11.5;
+        let x0 = rect.left() + 13.0;
+        let b1 = Rect::from_min_size(pos2(x0, cy - bar_h * 0.5), vec2(bar_w, bar_h));
+        let b2 = Rect::from_min_size(pos2(x0 + bar_w + 3.5, cy - bar_h * 0.5), vec2(bar_w, bar_h));
+        painter.rect_filled(b1, 1.0, txt_col);
+        painter.rect_filled(b2, 1.0, txt_col);
+
+        let lbl_rect = Rect::from_min_max(pos2(x0 + bar_w * 2.0 + 7.5, rect.top()), rect.right_bottom());
+        painter.text(
+            lbl_rect.center(),
+            Align2::CENTER_CENTER,
+            "PAUSA",
+            FontId::monospace(11.5),
+            txt_col,
+        );
+    } else {
+        // Triángulo Play vectorial verde fósforo centrado ópticamente
+        let x0 = rect.left() + 13.0;
+        let tri = vec![
+            pos2(x0, cy - 5.8),
+            pos2(x0 + 10.0, cy),
+            pos2(x0, cy + 5.8),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            tri,
+            p.led_green,
+            Stroke::new(1.0, p.chassis_outline),
+        ));
+
+        let lbl_rect = Rect::from_min_max(pos2(x0 + 13.0, rect.top()), rect.right_bottom());
+        painter.text(
+            lbl_rect.center(),
+            Align2::CENTER_CENTER,
+            "INICIAR",
+            FontId::monospace(11.0),
+            txt_col,
+        );
+    }
+
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Dibuja un LED hardware retro con halo y punto especular.
@@ -1016,12 +1335,13 @@ pub fn draw_floppy_icon(painter: &egui::Painter, rect: Rect, p: &RetroPalette, s
     );
 }
 
-/// Barra de recorte interactiva con dos manijas arrastrables `[IN]` y `[OUT]`.
+/// Barra de recorte interactiva con dos manijas arrastrables `[IN]` y `[OUT]` + indicador de preview.
 /// Devuelve `Some(timestamp_secs)` cuando el usuario mueve una manija para actualizar el preview CRT.
 pub fn draw_dual_trim_timeline(
     ui: &mut egui::Ui,
     p: &RetroPalette,
     total_dur: f64,
+    preview_time_secs: f64,
     trim_start: &mut f64,
     trim_end: &mut f64,
     drag_mode: &mut Option<TrimDragHandle>,
@@ -1102,14 +1422,39 @@ pub fn draw_dual_trim_timeline(
     );
     painter.rect_filled(sel_rect, 2.0, p.accent);
 
+    // Aguja del timestamp actualmente visible en el monitor CRT
+    let preview_x = track_rect.left()
+        + track_rect.width() * (preview_time_secs / total).clamp(0.0, 1.0) as f32;
+    painter.line_segment(
+        [
+            pos2(preview_x, track_rect.top() - 1.0),
+            pos2(preview_x, track_rect.bottom() + 1.0),
+        ],
+        Stroke::new(1.5, Color32::from_rgba_unmultiplied(p.crt_text.r(), p.crt_text.g(), p.crt_text.b(), 200)),
+    );
+
+    // Evitar solapamiento de etiquetas [IN] y [OUT] cuando el rango es corto.
+    let mut in_lbl_x = x0.clamp(track_rect.left() + 14.0, track_rect.right() - 24.0);
+    let mut out_lbl_x = x1.clamp(track_rect.left() + 24.0, track_rect.right() - 16.0);
+    let min_label_gap = 38.0;
+    if out_lbl_x - in_lbl_x < min_label_gap {
+        let mid = ((in_lbl_x + out_lbl_x) * 0.5).clamp(
+            track_rect.left() + min_label_gap * 0.5 + 14.0,
+            track_rect.right() - min_label_gap * 0.5 - 16.0,
+        );
+        in_lbl_x = mid - min_label_gap * 0.5;
+        out_lbl_x = mid + min_label_gap * 0.5;
+    }
+
     // Manija [IN]
     let in_active = *drag_mode == Some(TrimDragHandle::Start);
-    draw_timeline_handle(painter, p, x0, track_rect, "IN", in_active, true);
+    draw_timeline_handle(painter, p, x0, in_lbl_x, track_rect, "IN", in_active);
 
     // Manija [OUT]
     let out_active = *drag_mode == Some(TrimDragHandle::End);
-    draw_timeline_handle(painter, p, x1, track_rect, "OUT", out_active, false);
+    draw_timeline_handle(painter, p, x1, out_lbl_x, track_rect, "OUT", out_active);
 
+    resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     preview_seek
 }
 
@@ -1123,10 +1468,10 @@ fn draw_timeline_handle(
     painter: &egui::Painter,
     p: &RetroPalette,
     x: f32,
+    label_x: f32,
     track: Rect,
     tag: &str,
     active: bool,
-    is_left: bool,
 ) {
     let handle_rect = Rect::from_min_max(
         pos2(x - 4.5, track.top() - 2.0),
@@ -1141,11 +1486,6 @@ fn draw_timeline_handle(
         StrokeKind::Inside,
     );
 
-    let label_x = if is_left {
-        x.clamp(track.left() + 14.0, track.right() - 24.0)
-    } else {
-        x.clamp(track.left() + 24.0, track.right() - 16.0)
-    };
     painter.text(
         pos2(label_x, track.top() - 10.0),
         Align2::CENTER_CENTER,

@@ -171,10 +171,10 @@ impl MonitorInfo {
         format!("PANTALLA {}", self.index)
     }
 
-    /// Etiqueta descriptiva para botones de la UI (ej. `PANTALLA 1 · 1920x1080 ★`).
+    /// Etiqueta descriptiva para botones de la UI (ej. `PANTALLA 1 · 1920x1080 (PRI)`).
     pub fn ui_label(&self) -> String {
         if self.is_primary {
-            format!("PANTALLA {} · {}x{} ★", self.index, self.width, self.height)
+            format!("PANTALLA {} · {}x{} (PRI)", self.index, self.width, self.height)
         } else {
             format!("PANTALLA {} · {}x{}", self.index, self.width, self.height)
         }
@@ -335,7 +335,7 @@ mod tests {
             hmonitor: HMONITOR::default(),
         };
         assert_eq!(primary.short_label(), "PANTALLA 1");
-        assert_eq!(primary.ui_label(), "PANTALLA 1 · 1920x1080 ★");
+        assert_eq!(primary.ui_label(), "PANTALLA 1 · 1920x1080 (PRI)");
 
         let secondary = MonitorInfo {
             index: 2,

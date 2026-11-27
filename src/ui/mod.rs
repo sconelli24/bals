@@ -3,14 +3,16 @@ mod settings_view;
 mod theme;
 mod widgets;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
+use crossbeam_channel::Receiver;
 use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, pos2, vec2};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -25,15 +27,15 @@ use crate::hotkey::{self, HotkeyCaptureEvent, display_hotkey, parse_hotkey};
 use crate::ipc::{self, EngineTelemetrySnapshot, TelemetryState};
 use crate::startup;
 use crate::trimmer::{
-    ClipMetadata, PreviewFrame, TrimStats, compress_mp4_balanced, extract_mp4_frame_rgba,
-    probe_mp4_metadata, suggested_output_with_suffix, suggested_trim_output, trim_mp4_passthrough,
+    ClipMetadata, PreviewFrame, PreviewSession, TrimStats, compress_mp4_balanced,
+    suggested_output_with_suffix, suggested_trim_output, trim_mp4_passthrough,
 };
 use crate::ui::theme::{RetroPalette, apply_egui_theme};
 use crate::ui::widgets::{
     TrimDragHandle, draw_crt_monitor_shell, draw_crt_recess, draw_dual_vent_grille,
     draw_hardware_status_plate, draw_hardware_tab_rocker, draw_mini_bezel_vu,
     draw_power_led_socket, draw_recessed_bay, draw_scanlines, draw_status_led,
-    hardware_action_button,
+    hardware_action_button_enabled, hardware_transport_button,
 };
 use crate::updater::{self, CURRENT_VERSION, ReleaseInfo};
 
@@ -69,16 +71,148 @@ pub(crate) enum UpdateUiState {
     Error(String),
 }
 
+struct PreviewRequest {
+    request_id: u64,
+    path: PathBuf,
+    time_secs: f64,
+    need_metadata: bool,
+}
+
 struct PreviewResult {
     request_id: u64,
-    frame: PreviewFrame,
+    path: PathBuf,
+    frame: Option<PreviewFrame>,
+    metadata: Option<ClipMetadata>,
+}
+
+struct UiInitData {
+    detected_encoders: DetectedEncoders,
+    cameras: Vec<CameraDeviceInfo>,
+    clips: Vec<ClipEntry>,
+}
+
+/// Hilo único persistente de decodificación CRT para mantener fluido el scrubbing sin spawnear hilos.
+struct PreviewWorker {
+    pending: Arc<(Mutex<Option<PreviewRequest>>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PreviewWorker {
+    fn start(
+        req_counter: Arc<AtomicU64>,
+        ready_slot: Arc<Mutex<Option<PreviewResult>>>,
+    ) -> Self {
+        let pending: Arc<(Mutex<Option<PreviewRequest>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pending_bg = Arc::clone(&pending);
+        let stop_bg = Arc::clone(&stop);
+
+        let handle = std::thread::Builder::new()
+            .name("bals-crt-preview".to_string())
+            .spawn(move || {
+                let mut session = PreviewSession::new().ok();
+                loop {
+                    let req = {
+                        let (lock, cv) = &*pending_bg;
+                        let mut guard = lock.lock().unwrap();
+                        while guard.is_none() && !stop_bg.load(Ordering::Relaxed) {
+                            guard = cv.wait(guard).unwrap();
+                        }
+                        if stop_bg.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        guard.take()
+                    };
+
+                    let Some(req) = req else { continue };
+                    if req_counter.load(Ordering::Relaxed) != req.request_id {
+                        continue;
+                    }
+
+                    if session.is_none() {
+                        session = PreviewSession::new().ok();
+                    }
+                    let Some(sess) = session.as_mut() else {
+                        if let Ok(mut slot) = ready_slot.lock() {
+                            *slot = Some(PreviewResult {
+                                request_id: req.request_id,
+                                path: req.path,
+                                frame: None,
+                                metadata: None,
+                            });
+                        }
+                        continue;
+                    };
+
+                    let metadata = if req.need_metadata {
+                        sess.probe_metadata(&req.path).ok()
+                    } else {
+                        None
+                    };
+
+                    if req_counter.load(Ordering::Relaxed) != req.request_id {
+                        continue;
+                    }
+
+                    let seek_t = if req.need_metadata {
+                        metadata
+                            .map(|m| 0.2_f64.min(m.duration_secs * 0.5))
+                            .unwrap_or(req.time_secs)
+                    } else {
+                        req.time_secs
+                    };
+
+                    let frame = sess.extract_frame(&req.path, seek_t, 448, 252).ok();
+
+                    if req_counter.load(Ordering::Relaxed) == req.request_id {
+                        if let Ok(mut slot) = ready_slot.lock() {
+                            *slot = Some(PreviewResult {
+                                request_id: req.request_id,
+                                path: req.path,
+                                frame,
+                                metadata,
+                            });
+                        }
+                    }
+                }
+            })
+            .ok();
+
+        Self {
+            pending,
+            stop,
+            handle,
+        }
+    }
+
+    fn request(&self, req: PreviewRequest) {
+        let (lock, cv) = &*self.pending;
+        if let Ok(mut guard) = lock.lock() {
+            *guard = Some(req);
+            cv.notify_one();
+        }
+    }
+}
+
+impl Drop for PreviewWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.pending.1.notify_all();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 pub(crate) struct BalsUiApp {
     pub tab: Tab,
     pub cfg: AppConfig,
+    pub saved_cfg: AppConfig,
     pub applied_theme: Option<UiTheme>,
     pub start_with_windows: bool,
+    pub saved_start_with_windows: bool,
     pub hotkey_error: Option<String>,
     pub listening_hotkey: bool,
     hotkey_prev_keys: [bool; 256],
@@ -98,6 +232,11 @@ pub(crate) struct BalsUiApp {
     pub detected_encoders: DetectedEncoders,
     pub monitors: Vec<MonitorInfo>,
     pub cameras: Vec<CameraDeviceInfo>,
+    pub cameras_loading: bool,
+    pub clips_loading: bool,
+    init_rx: Option<Receiver<UiInitData>>,
+    cameras_rx: Option<Receiver<Vec<CameraDeviceInfo>>>,
+    clips_rx: Option<Receiver<Vec<ClipEntry>>>,
     pub update_state: Arc<Mutex<UpdateUiState>>,
     pub audio_meter: AudioLevelMonitor,
     pub desktop_vu_display: f32,
@@ -118,33 +257,28 @@ pub(crate) struct BalsUiApp {
     pub trim_drag_handle: Option<TrimDragHandle>,
     pub trim_state: Arc<Mutex<TrimState>>,
     pub confirm_delete: Option<PathBuf>,
+    metadata_cache: HashMap<(PathBuf, SystemTime, u64), ClipMetadata>,
 
-    // Vista previa de frame CRT asíncrona con debounce
+    // Vista previa de frame CRT asíncrona con debounce sobre worker persistente
     pub preview_texture: Option<egui::TextureHandle>,
     pub preview_time_secs: f64,
     pub preview_loading: bool,
     preview_req_counter: Arc<AtomicU64>,
     preview_ready: Arc<Mutex<Option<PreviewResult>>>,
+    preview_worker: PreviewWorker,
     pending_preview_seek: Option<(f64, Instant)>,
 }
 
 impl BalsUiApp {
     fn new(ctx: &egui::Context) -> Self {
-        let mut cfg = AppConfig::load_or_create();
+        let cfg = AppConfig::load_or_create();
+        let saved_cfg = cfg.clone();
         let last_config_stamp = read_config_stamp();
         let start_with_windows = startup::is_autostart_enabled();
-        let clips = scan_clips(&cfg.clips_dir);
         let daemon_running = ipc::is_daemon_running();
         let telemetry = ipc::read_engine_telemetry();
         let last_clip_event_seq = telemetry.as_ref().map_or(0, |t| t.clip_event_seq);
-        let detected_encoders = detect_system_encoders();
-        if cfg.encoder_pref == EncoderPreference::HardwareGpu
-            && detected_encoders.hw_name.is_none()
-        {
-            cfg.encoder_pref = EncoderPreference::SoftwareCpu;
-        }
         let monitors = list_monitors();
-        let cameras = list_cameras();
 
         // Cargar ícono CRT 64×64 pixel-art con filtrado NEAREST (sin blur).
         let raw_icon = include_bytes!("../../assets/icon_64.rgba");
@@ -155,11 +289,34 @@ impl BalsUiApp {
             egui::TextureOptions::NEAREST,
         ));
 
-        let mut app = Self {
+        let preview_req_counter = Arc::new(AtomicU64::new(0));
+        let preview_ready = Arc::new(Mutex::new(None));
+        let preview_worker =
+            PreviewWorker::start(Arc::clone(&preview_req_counter), Arc::clone(&preview_ready));
+
+        // Escaneo inicial pesado (encoders MFT, webcams USB, carpeta de clips) en segundo plano
+        // para que la ventana abra de forma instantánea (<30 ms) sin freezeo.
+        let (init_tx, init_rx) = crossbeam_channel::bounded::<UiInitData>(1);
+        let clips_dir_init = cfg.clips_dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("bals-ui-init".to_string())
+            .spawn(move || {
+                let detected_encoders = detect_system_encoders();
+                let cameras = list_cameras();
+                let clips = scan_clips(&clips_dir_init);
+                let _ = init_tx.send(UiInitData {
+                    detected_encoders,
+                    cameras,
+                    clips,
+                });
+            });
+
+        Self {
             tab: Tab::Settings,
-            cfg,
+            saved_cfg,
             applied_theme: None,
             start_with_windows,
+            saved_start_with_windows: start_with_windows,
             hotkey_error: None,
             listening_hotkey: false,
             hotkey_prev_keys: [false; 256],
@@ -172,16 +329,21 @@ impl BalsUiApp {
             last_telemetry_poll: Instant::now(),
             last_clip_event_seq,
             last_config_stamp,
-            detected_encoders,
+            detected_encoders: DetectedEncoders::default(),
             monitors,
-            cameras,
+            cameras: Vec::new(),
+            cameras_loading: true,
+            clips_loading: true,
+            init_rx: Some(init_rx),
+            cameras_rx: None,
+            clips_rx: None,
             update_state: Arc::new(Mutex::new(UpdateUiState::Idle)),
-            audio_meter: AudioLevelMonitor::start(),
+            audio_meter: AudioLevelMonitor::start(cfg.mic_enabled),
             desktop_vu_display: 0.0,
             mic_vu_display: 0.0,
             last_vu_tick: Instant::now(),
             logo_texture,
-            clips,
+            clips: Vec::new(),
             clip_filter: String::new(),
             selected_clip: None,
             selected_metadata: None,
@@ -191,18 +353,49 @@ impl BalsUiApp {
             trim_drag_handle: None,
             trim_state: Arc::new(Mutex::new(TrimState::Idle)),
             confirm_delete: None,
+            metadata_cache: HashMap::new(),
             preview_texture: None,
             preview_time_secs: 0.0,
             preview_loading: false,
-            preview_req_counter: Arc::new(AtomicU64::new(0)),
-            preview_ready: Arc::new(Mutex::new(None)),
+            preview_req_counter,
+            preview_ready,
+            preview_worker,
             pending_preview_seek: None,
-        };
-
-        if let Some(first) = app.clips.first().cloned() {
-            app.select_clip(first.path);
+            cfg,
         }
-        app
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        let c = &self.cfg;
+        let s = &self.saved_cfg;
+        c.resolution != s.resolution
+            || c.fps != s.fps
+            || c.quality != s.quality
+            || c.encoder_pref != s.encoder_pref
+            || c.replay_duration != s.replay_duration
+            || c.save_clip_hotkey != s.save_clip_hotkey
+            || c.capture_mode != s.capture_mode
+            || c.selected_monitor != s.selected_monitor
+            || c.audio_capture_mode != s.audio_capture_mode
+            || c.mic_enabled != s.mic_enabled
+            || (c.game_volume - s.game_volume).abs() > 0.005
+            || (c.mic_volume - s.mic_volume).abs() > 0.005
+            || c.capture_cursor != s.capture_cursor
+            || c.stretch_aspect_ratio != s.stretch_aspect_ratio
+            || c.camera_enabled != s.camera_enabled
+            || c.selected_camera != s.selected_camera
+            || c.camera_preset != s.camera_preset
+            || c.camera_corner != s.camera_corner
+            || c.camera_size != s.camera_size
+            || c.camera_mirror != s.camera_mirror
+            || c.sound_feedback != s.sound_feedback
+            || c.show_notifications != s.show_notifications
+            || c.auto_update != s.auto_update
+            || c.ui_theme != s.ui_theme
+            || c.crt_scanlines != s.crt_scanlines
+            || c.clips_dir != s.clips_dir
+            || c.extra_game_exes != s.extra_game_exes
+            || self.start_with_windows != self.saved_start_with_windows
     }
 
     pub fn set_banner(&mut self, msg: impl Into<String>, is_err: bool) {
@@ -257,11 +450,36 @@ impl BalsUiApp {
     }
 
     pub fn refresh_cameras(&mut self) {
-        self.cameras = list_cameras();
+        if self.cameras_loading {
+            return;
+        }
+        self.cameras_loading = true;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.cameras_rx = Some(rx);
+        let _ = std::thread::Builder::new()
+            .name("bals-cam-scan".to_string())
+            .spawn(move || {
+                let _ = tx.send(list_cameras());
+            });
     }
 
     pub fn refresh_clips(&mut self) {
-        self.clips = scan_clips(&self.cfg.clips_dir);
+        if self.clips_loading {
+            return;
+        }
+        self.clips_loading = true;
+        let dir = self.cfg.clips_dir.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.clips_rx = Some(rx);
+        let _ = std::thread::Builder::new()
+            .name("bals-clips-scan".to_string())
+            .spawn(move || {
+                let _ = tx.send(scan_clips(&dir));
+            });
+    }
+
+    fn apply_clips_list(&mut self, clips: Vec<ClipEntry>) {
+        self.clips = clips;
         if let Some(sel) = &self.selected_clip {
             if !sel.exists() {
                 self.selected_clip = None;
@@ -277,21 +495,39 @@ impl BalsUiApp {
         }
     }
 
+    fn metadata_key_for(&self, path: &Path) -> Option<(PathBuf, SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?;
+        Some((path.to_path_buf(), modified, meta.len()))
+    }
+
     pub fn select_clip(&mut self, path: PathBuf) {
-        let meta = probe_mp4_metadata(&path).ok();
-        let dur = meta.map(|m| m.duration_secs);
+        let cached_meta = self
+            .metadata_key_for(&path)
+            .and_then(|key| self.metadata_cache.get(&key).copied());
+
         self.selected_clip = Some(path);
-        self.selected_metadata = meta;
-        self.selected_duration = dur;
-        self.trim_start = 0.0;
-        self.trim_end = dur.unwrap_or(10.0);
         self.confirm_delete = None;
         self.preview_texture = None;
         self.preview_time_secs = 0.0;
+        self.pending_preview_seek = None;
         if let Ok(mut st) = self.trim_state.lock() {
             *st = TrimState::Idle;
         }
-        self.request_preview_frame(0.2_f64.min(dur.unwrap_or(0.0)));
+
+        if let Some(meta) = cached_meta {
+            self.selected_metadata = Some(meta);
+            self.selected_duration = Some(meta.duration_secs);
+            self.trim_start = 0.0;
+            self.trim_end = meta.duration_secs;
+            self.dispatch_preview_request(0.2_f64.min(meta.duration_secs * 0.5), false);
+        } else {
+            self.selected_metadata = None;
+            self.selected_duration = None;
+            self.trim_start = 0.0;
+            self.trim_end = 10.0;
+            self.dispatch_preview_request(0.2, true);
+        }
     }
 
     pub fn schedule_preview_seek(&mut self, time_secs: f64) {
@@ -299,35 +535,19 @@ impl BalsUiApp {
         self.pending_preview_seek = Some((time_secs, Instant::now()));
     }
 
-    fn request_preview_frame(&mut self, time_secs: f64) {
+    fn dispatch_preview_request(&mut self, time_secs: f64, need_metadata: bool) {
         let Some(path) = self.selected_clip.clone() else {
             return;
         };
         let req_id = self.preview_req_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let counter = Arc::clone(&self.preview_req_counter);
-        let ready = Arc::clone(&self.preview_ready);
         self.preview_loading = true;
         self.preview_time_secs = time_secs;
-
-        std::thread::Builder::new()
-            .name("bals-crt-preview".to_string())
-            .spawn(move || {
-                // Cancelación temprana si ya llegó una solicitud más nueva.
-                if counter.load(Ordering::Relaxed) != req_id {
-                    return;
-                }
-                if let Ok(frame) = extract_mp4_frame_rgba(&path, time_secs, 448, 252) {
-                    if counter.load(Ordering::Relaxed) == req_id {
-                        if let Ok(mut slot) = ready.lock() {
-                            *slot = Some(PreviewResult {
-                                request_id: req_id,
-                                frame,
-                            });
-                        }
-                    }
-                }
-            })
-            .ok();
+        self.preview_worker.request(PreviewRequest {
+            request_id: req_id,
+            path,
+            time_secs,
+            need_metadata,
+        });
     }
 
     pub fn save_config(&mut self) {
@@ -343,9 +563,11 @@ impl BalsUiApp {
             self.set_banner(format!("Error configurando inicio Windows: {err:#}"), true);
             return;
         }
+        self.saved_start_with_windows = self.start_with_windows;
 
         match self.cfg.save() {
             Ok(()) => {
+                self.saved_cfg = self.cfg.clone();
                 self.last_config_stamp = read_config_stamp();
                 self.daemon_running = ipc::is_daemon_running();
                 if ipc::notify_reload_config() {
@@ -472,6 +694,50 @@ impl BalsUiApp {
     }
 
     fn poll_background_states(&mut self, ctx: &egui::Context) -> Option<String> {
+        // 0. Completar escaneo inicial asíncrono (encoders, webcams, clips) sin bloquear la UI.
+        if let Some(rx) = &self.init_rx {
+            if let Ok(data) = rx.try_recv() {
+                self.detected_encoders = data.detected_encoders;
+                if self.cfg.encoder_pref == EncoderPreference::HardwareGpu
+                    && self.detected_encoders.hw_name.is_none()
+                {
+                    self.cfg.encoder_pref = EncoderPreference::SoftwareCpu;
+                    self.saved_cfg.encoder_pref = EncoderPreference::SoftwareCpu;
+                }
+                if self.cameras_rx.is_none() {
+                    self.cameras = data.cameras;
+                    self.cameras_loading = false;
+                }
+                if self.clips_rx.is_none() {
+                    self.clips_loading = false;
+                    self.apply_clips_list(data.clips);
+                }
+                self.init_rx = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+
+        if let Some(rx) = &self.cameras_rx {
+            if let Ok(cams) = rx.try_recv() {
+                self.cameras = cams;
+                self.cameras_loading = false;
+                self.cameras_rx = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(60));
+            }
+        }
+
+        if let Some(rx) = &self.clips_rx {
+            if let Ok(clips) = rx.try_recv() {
+                self.clips_loading = false;
+                self.clips_rx = None;
+                self.apply_clips_list(clips);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+
         // 1. Telemetría compartida daemon → UI cada 200 ms + recarga automática si el tray editó config.toml.
         if self.last_telemetry_poll.elapsed() >= Duration::from_millis(200) {
             self.last_telemetry_poll = Instant::now();
@@ -485,7 +751,8 @@ impl BalsUiApp {
                         let needs_monitors = reloaded.capture_mode
                             == crate::config::CaptureMode::ManualMonitor
                             && self.monitors.is_empty();
-                        self.cfg = reloaded;
+                        self.cfg = reloaded.clone();
+                        self.saved_cfg = reloaded;
                         self.hotkey_error = None;
                         if needs_monitors {
                             self.refresh_monitors();
@@ -520,26 +787,39 @@ impl BalsUiApp {
         if let Some((seek_t, at)) = self.pending_preview_seek {
             if at.elapsed() >= Duration::from_millis(90) {
                 self.pending_preview_seek = None;
-                self.request_preview_frame(seek_t);
+                self.dispatch_preview_request(seek_t, false);
             } else {
                 ctx.request_repaint_after(Duration::from_millis(40));
             }
         }
 
-        // 3. Cargar textura si el worker terminó de decodificar el frame CRT.
+        // 3. Cargar textura y metadata si el worker terminó de decodificar el frame CRT.
         if let Ok(mut slot) = self.preview_ready.lock() {
             if let Some(res) = slot.take() {
                 if res.request_id == self.preview_req_counter.load(Ordering::Relaxed) {
-                    let img = egui::ColorImage::from_rgba_unmultiplied(
-                        [res.frame.width as usize, res.frame.height as usize],
-                        &res.frame.rgba,
-                    );
-                    self.preview_texture = Some(ctx.load_texture(
-                        "bals_crt_preview",
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                    self.preview_time_secs = res.frame.actual_time_secs;
+                    if let Some(meta) = res.metadata {
+                        if let Some(key) = self.metadata_key_for(&res.path) {
+                            self.metadata_cache.insert(key, meta);
+                        }
+                        if self.selected_clip.as_ref() == Some(&res.path) {
+                            self.selected_metadata = Some(meta);
+                            self.selected_duration = Some(meta.duration_secs);
+                            self.trim_start = 0.0;
+                            self.trim_end = meta.duration_secs;
+                        }
+                    }
+                    if let Some(frame) = res.frame {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [frame.width as usize, frame.height as usize],
+                            &frame.rgba,
+                        );
+                        self.preview_texture = Some(ctx.load_texture(
+                            "bals_crt_preview",
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self.preview_time_secs = frame.actual_time_secs;
+                    }
                     self.preview_loading = false;
                 }
             }
@@ -621,9 +901,10 @@ impl BalsUiApp {
             (self.mic_vu_display - decay).max(m_raw)
         };
 
-        // Pausar cadencia alta del VU cuando la ventana pierde foco (y restaurar hotkey si se escuchaba).
+        // Pausar cadencia alta del VU cuando la ventana pierde foco o no está en Ajustes.
         let focused = ctx.input(|i| i.focused);
-        self.audio_meter.set_paused(!focused);
+        self.audio_meter.set_mic_enabled(self.cfg.mic_enabled);
+        self.audio_meter.set_paused(!focused || self.tab != Tab::Settings);
         if !focused && self.listening_hotkey {
             self.set_listening_hotkey(false);
         }
@@ -855,44 +1136,42 @@ impl eframe::App for BalsUiApp {
                                 });
 
                             if self.daemon_running {
+                                let is_rec = self
+                                    .telemetry
+                                    .as_ref()
+                                    .is_some_and(|t| t.state != TelemetryState::Idle);
                                 let clip_btn_lbl = format!(
                                     "[{}] GUARDAR CLIP",
                                     display_hotkey(&self.cfg.save_clip_hotkey)
                                 );
-                                if hardware_action_button(
+                                let clip_hover = if is_rec {
+                                    "Guardar los últimos segundos del Replay Buffer"
+                                } else {
+                                    "Inicia un juego o pulsa INICIAR para activar el Replay Buffer"
+                                };
+                                if hardware_action_button_enabled(
                                     ui,
                                     &p,
                                     &clip_btn_lbl,
                                     p.danger,
                                     p.danger_text,
                                     32.0,
+                                    is_rec,
                                 )
-                                .on_hover_text("Guardar los últimos segundos del Replay Buffer")
+                                .on_hover_text(clip_hover)
                                 .clicked()
                                 {
                                     ipc::notify_save_clip();
                                     self.set_banner("Solicitud de clip enviada al motor.", false);
                                 }
 
-                                let is_rec = self
-                                    .telemetry
-                                    .as_ref()
-                                    .is_some_and(|t| t.state != TelemetryState::Idle);
-                                let rec_lbl = if is_rec { "⏸" } else { "▶" };
-                                if hardware_action_button(
-                                    ui,
-                                    &p,
-                                    rec_lbl,
-                                    p.chassis_btn_bg,
-                                    p.chassis_text,
-                                    32.0,
-                                )
-                                .on_hover_text(if is_rec {
-                                    "Pausar Replay Buffer (F5)"
-                                } else {
-                                    "Iniciar Replay Buffer manual (F5)"
-                                })
-                                .clicked()
+                                if hardware_transport_button(ui, &p, is_rec, 32.0)
+                                    .on_hover_text(if is_rec {
+                                        "Pausar Replay Buffer (F5)"
+                                    } else {
+                                        "Iniciar Replay Buffer manual (F5)"
+                                    })
+                                    .clicked()
                                 {
                                     ipc::notify_toggle_record();
                                     self.set_banner("Estado de grabación alternado.", false);
@@ -957,19 +1236,29 @@ impl eframe::App for BalsUiApp {
                         pos2(center_x, bottom_rect.center().y - 13.0),
                         vec2(center_w, 26.0),
                     );
+                    let mut clear_banner = false;
                     ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
                         if let Some((msg, is_err, _)) = &self.banner_msg {
-                            let (brect, _) =
-                                ui.allocate_exact_size(vec2(center_w, 26.0), Sense::hover());
+                            let (brect, bresp) =
+                                ui.allocate_exact_size(vec2(center_w, 26.0), Sense::click());
                             draw_recessed_bay(ui.painter(), brect, &p, 3.5);
                             let col = if *is_err { p.led_red } else { p.accent_bright };
-                            ui.painter().text(
+                            let max_chars = ((brect.width() - 16.0) / 6.6).max(16.0) as usize;
+                            let disp_msg = truncate_banner_text(msg, max_chars);
+                            ui.painter().with_clip_rect(brect.shrink2(vec2(6.0, 2.0))).text(
                                 brect.center(),
                                 Align2::CENTER_CENTER,
-                                msg,
+                                disp_msg,
                                 FontId::monospace(10.8),
                                 col,
                             );
+                            if bresp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Clic para cerrar aviso")
+                                .clicked()
+                            {
+                                clear_banner = true;
+                            }
                         } else {
                             draw_mini_bezel_vu(
                                 ui,
@@ -980,6 +1269,9 @@ impl eframe::App for BalsUiApp {
                             );
                         }
                     });
+                    if clear_banner {
+                        self.banner_msg = None;
+                    }
 
                     // Derecha: placa hardware moldeada con estado del encoder/motor
                     let enc_text = self
@@ -1156,5 +1448,16 @@ pub(crate) fn open_in_shell(path: &Path) {
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
+    }
+}
+
+fn truncate_banner_text(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars || max_chars < 4 {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }

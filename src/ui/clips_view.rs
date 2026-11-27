@@ -4,7 +4,8 @@ use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKin
 
 use crate::ui::theme::RetroPalette;
 use crate::ui::widgets::{
-    SectionIcon, draw_dual_trim_timeline, draw_floppy_icon, draw_scanlines, retro_card, retro_pill,
+    SectionIcon, draw_dual_trim_timeline, draw_floppy_icon, draw_scanlines, retro_card,
+    retro_pill, retro_play_pill,
 };
 use crate::ui::{BalsUiApp, open_in_shell};
 
@@ -52,21 +53,24 @@ fn render_clips_archive(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette
         "ARCHIVO DE CLIPS",
         Some(&badge),
         |ui| {
-        // Controles rápidos: filtro + actualizar + abrir carpeta
+        // Controles rápidos: filtro + recargar + abrir carpeta
         ui.horizontal(|ui| {
-            let filter_w = (ui.available_width() - 106.0).max(80.0);
+            let filter_w = (ui.available_width() - 144.0).max(80.0);
             ui.add(
                 egui::TextEdit::singleline(&mut app.clip_filter)
                     .hint_text("Filtrar...")
                     .desired_width(filter_w),
             );
-            if retro_pill(ui, p, false, "ACT", vec2(38.0, 22.0))
-                .on_hover_text("Actualizar lista de clips")
-                .clicked()
-            {
-                app.refresh_clips();
-            }
-            if retro_pill(ui, p, false, "DIR", vec2(46.0, 22.0))
+            ui.add_enabled_ui(!app.clips_loading, |ui| {
+                let rec_lbl = if app.clips_loading { "..." } else { "RECARGAR" };
+                if retro_pill(ui, p, false, rec_lbl, vec2(68.0, 22.0))
+                    .on_hover_text("Actualizar lista de clips")
+                    .clicked()
+                {
+                    app.refresh_clips();
+                }
+            });
+            if retro_pill(ui, p, false, "CARPETA", vec2(62.0, 22.0))
                 .on_hover_text("Abrir carpeta de clips en el Explorador")
                 .clicked()
             {
@@ -94,7 +98,9 @@ fn render_clips_archive(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette
         if filtered.is_empty() {
             ui.add_space(16.0);
             ui.label(
-                egui::RichText::new(if app.clips.is_empty() {
+                egui::RichText::new(if app.clips_loading && app.clips.is_empty() {
+                    "ESCANEANDO CLIPS...".to_string()
+                } else if app.clips.is_empty() {
                     format!(
                         "SIN CLIPS TODAVÍA.\nPresiona [ {} ] mientras juegas.\n\n{}",
                         app.cfg.save_clip_hotkey,
@@ -198,6 +204,7 @@ fn render_clips_archive(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette
                         );
                     }
 
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
                         clicked_path = Some(clip.path.clone());
                     }
@@ -328,6 +335,7 @@ fn render_crt_deck(
                     ui,
                     p,
                     total,
+                    app.preview_time_secs,
                     &mut app.trim_start,
                     &mut app.trim_end,
                     &mut app.trim_drag_handle,
@@ -378,6 +386,12 @@ fn render_crt_deck(
                         );
                     });
                 });
+            } else if app.preview_loading {
+                ui.label(
+                    egui::RichText::new("LEYENDO METADATOS DEL CLIP...")
+                        .size(11.5)
+                        .color(p.amber),
+                );
             } else {
                 ui.label(
                     egui::RichText::new("No se pudo leer la duración del archivo.")
@@ -388,19 +402,19 @@ fn render_crt_deck(
 
             ui.add_space(8.0);
 
-            // 3. Botonera física Deck (Play, Recorte Passthrough, Discord <10MB, <25MB, Copiar, Eliminar)
+            // 3. Botonera física Deck (Ver, Recorte Passthrough, Copiar Ruta, Borrar, Comprimir)
             let trim_in_progress = running_op.is_some();
             ui.add_enabled_ui(!trim_in_progress, |ui| {
                 let row_w = ui.available_width();
                 ui.horizontal(|ui| {
-                    if retro_pill(ui, p, false, "▶ PLAY", vec2(74.0, 30.0))
+                    if retro_play_pill(ui, p, "VER", vec2(66.0, 30.0))
                         .on_hover_text("Abrir en el reproductor de video de Windows")
                         .clicked()
                     {
                         open_in_shell(&sel_path);
                     }
 
-                    let trim_w = (row_w - 190.0).max(150.0);
+                    let trim_w = (row_w - 266.0).max(150.0);
                     let trim_lbl = running_op.unwrap_or("RECORTAR SIN PÉRDIDA");
                     if retro_pill(ui, p, true, trim_lbl, vec2(trim_w, 30.0))
                         .on_hover_text("Corte instantáneo MP4 passthrough sin recodificar")
@@ -409,7 +423,7 @@ fn render_crt_deck(
                         app.start_trim();
                     }
 
-                    if retro_pill(ui, p, false, "RUTA", vec2(50.0, 30.0))
+                    if retro_pill(ui, p, false, "COPIAR RUTA", vec2(92.0, 30.0))
                         .on_hover_text("Copiar ruta completa del clip al portapapeles")
                         .clicked()
                     {
@@ -419,8 +433,9 @@ fn render_crt_deck(
 
                     // Botón eliminar con confirmación en 2 clics
                     let confirming = app.confirm_delete.as_ref() == Some(&sel_path);
-                    let del_lbl = if confirming { "OK?" } else { "DEL" };
-                    let (del_rect, del_resp) = ui.allocate_exact_size(vec2(46.0, 30.0), Sense::click());
+                    let del_lbl = if confirming { "¿CONFIRMAR?" } else { "BORRAR" };
+                    let (del_rect, del_resp) =
+                        ui.allocate_exact_size(vec2(84.0, 30.0), Sense::click());
                     let del_bg = if confirming {
                         p.danger
                     } else if del_resp.hovered() {
@@ -439,10 +454,11 @@ fn render_crt_deck(
                         del_rect.center(),
                         Align2::CENTER_CENTER,
                         del_lbl,
-                        FontId::monospace(11.5),
+                        FontId::monospace(11.0),
                         if confirming { p.danger_text } else { p.crt_text },
                     );
                     if del_resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(if confirming {
                             "Clic nuevamente para confirmar eliminación permanente"
                         } else {
@@ -479,6 +495,36 @@ fn render_crt_deck(
                     app.start_compress_balanced();
                 }
             });
+
+            if let Some(op_label) = running_op {
+                ui.add_space(5.0);
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 12.0), Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(bar_rect, 2.0, p.crt_recess);
+                painter.rect_stroke(
+                    bar_rect,
+                    2.0,
+                    Stroke::new(1.0, p.crt_widget_hover),
+                    StrokeKind::Inside,
+                );
+                let t = ui.ctx().input(|i| i.time) as f32;
+                let phase = (t * 1.4).fract();
+                let seg_w = (bar_rect.width() * 0.28).max(32.0);
+                let x = bar_rect.left() + (bar_rect.width() - seg_w) * phase;
+                let seg_rect = Rect::from_min_size(
+                    pos2(x, bar_rect.top() + 2.0),
+                    vec2(seg_w, bar_rect.height() - 4.0),
+                );
+                painter.rect_filled(seg_rect, 1.5, p.amber);
+                painter.text(
+                    bar_rect.center(),
+                    Align2::CENTER_CENTER,
+                    op_label,
+                    FontId::monospace(9.5),
+                    p.crt_text,
+                );
+            }
         },
     );
 }

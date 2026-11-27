@@ -1,5 +1,6 @@
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
@@ -361,8 +362,18 @@ impl H264Encoder {
         let mut packets = Vec::new();
 
         if self.is_async {
+            let wait_start = Instant::now();
             while self.pending_input_requests == 0 {
-                self.poll_async_event(false, &mut packets)?;
+                if !self.poll_async_event(true, &mut packets)? {
+                    if wait_start.elapsed() >= Duration::from_millis(1200) {
+                        bail!("Timeout esperando METransformNeedInput del encoder H.264");
+                    }
+                    if wait_start.elapsed() < Duration::from_micros(300) {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
             }
             self.pending_input_requests -= 1;
 
@@ -399,13 +410,18 @@ impl H264Encoder {
         }
 
         if let Some(event_gen) = self.event_gen.clone() {
+            let drain_start = Instant::now();
             loop {
-                let event = match unsafe {
-                    event_gen.GetEvent(
-                        windows::Win32::Media::MediaFoundation::MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0),
-                    )
-                } {
+                let event = match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                     Ok(ev) => ev,
+                    Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                        if drain_start.elapsed() >= Duration::from_millis(1000) {
+                            debug!("Timeout drenando eventos finales del MFT asíncrono");
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
                     Err(_) => break,
                 };
                 let ev_type = unsafe { event.GetType() }.unwrap_or(0);

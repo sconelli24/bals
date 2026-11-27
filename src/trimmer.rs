@@ -122,8 +122,79 @@ fn probe_metadata_inner(path: &Path) -> Result<ClipMetadata> {
     })
 }
 
+/// Sesión persistente de vista previa CRT que mantiene `IMFStartup` y el último `IMFSourceReader`
+/// abiertos para hacer *scrubbing* instantáneo al arrastrar `[IN]` / `[OUT]`.
+pub struct PreviewSession {
+    mf_started: bool,
+    open_clip: Option<OpenPreviewReader>,
+}
+
+struct OpenPreviewReader {
+    path: PathBuf,
+    max_w: u32,
+    max_h: u32,
+    reader: IMFSourceReader,
+    video_idx: u32,
+    actual_w: u32,
+    actual_h: u32,
+    default_stride: i32,
+}
+
+impl PreviewSession {
+    pub fn new() -> Result<Self> {
+        unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (PreviewSession) falló")?;
+        Ok(Self {
+            mf_started: true,
+            open_clip: None,
+        })
+    }
+
+    pub fn probe_metadata(&self, path: &Path) -> Result<ClipMetadata> {
+        probe_metadata_inner(path)
+    }
+
+    pub fn extract_frame(
+        &mut self,
+        path: &Path,
+        time_secs: f64,
+        max_w: u32,
+        max_h: u32,
+    ) -> Result<PreviewFrame> {
+        let reuse = self
+            .open_clip
+            .as_ref()
+            .is_some_and(|c| c.path == path && c.max_w == max_w && c.max_h == max_h);
+        if !reuse {
+            self.open_clip = None;
+            let opened = open_preview_reader(path, max_w, max_h)?;
+            self.open_clip = Some(opened);
+        }
+        let clip = self.open_clip.as_ref().unwrap();
+        read_preview_frame_from_reader(
+            &clip.reader,
+            clip.video_idx,
+            clip.actual_w,
+            clip.actual_h,
+            clip.default_stride,
+            time_secs,
+        )
+    }
+}
+
+impl Drop for PreviewSession {
+    fn drop(&mut self) {
+        self.open_clip = None;
+        if self.mf_started {
+            unsafe {
+                let _ = MFShutdown();
+            }
+        }
+    }
+}
+
 /// Extrae un único frame de vista previa RGBA8 en `time_secs` (escalado a `max_w x max_h`)
 /// usando Media Foundation nativo sin dependencias externas.
+#[allow(dead_code)]
 pub fn extract_mp4_frame_rgba(
     path: &Path,
     time_secs: f64,
@@ -138,12 +209,25 @@ pub fn extract_mp4_frame_rgba(
     res
 }
 
+#[allow(dead_code)]
 fn extract_frame_inner(
     path: &Path,
     time_secs: f64,
     max_w: u32,
     max_h: u32,
 ) -> Result<PreviewFrame> {
+    let opened = open_preview_reader(path, max_w, max_h)?;
+    read_preview_frame_from_reader(
+        &opened.reader,
+        opened.video_idx,
+        opened.actual_w,
+        opened.actual_h,
+        opened.default_stride,
+        time_secs,
+    )
+}
+
+fn open_preview_reader(path: &Path, max_w: u32, max_h: u32) -> Result<OpenPreviewReader> {
     let mut attrs: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut attrs, 2) }?;
     let attrs = attrs.context("MFCreateAttributes (preview) devolvió None")?;
@@ -199,12 +283,6 @@ fn extract_frame_inner(
         reader.SetCurrentMediaType(video_idx, None, &rgb_type)?;
     }
 
-    let target_100ns = (time_secs.max(0.0) * 10_000_000.0) as i64;
-    if target_100ns > 0 {
-        let pos = PROPVARIANT::from(target_100ns);
-        let _ = unsafe { reader.SetCurrentPosition(&GUID::zeroed(), &pos) };
-    }
-
     // Consultar dimensiones y stride reales negociados tras SetCurrentMediaType.
     let current_type = unsafe { reader.GetCurrentMediaType(video_idx) }?;
     let (actual_w, actual_h) = unsafe { current_type.GetUINT64(&MF_MT_FRAME_SIZE) }
@@ -213,6 +291,30 @@ fn extract_frame_inner(
     let default_stride = unsafe { current_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
         .map(|u| u as i32)
         .unwrap_or((actual_w * 4) as i32);
+
+    Ok(OpenPreviewReader {
+        path: path.to_path_buf(),
+        max_w,
+        max_h,
+        reader,
+        video_idx,
+        actual_w,
+        actual_h,
+        default_stride,
+    })
+}
+
+fn read_preview_frame_from_reader(
+    reader: &IMFSourceReader,
+    video_idx: u32,
+    actual_w: u32,
+    actual_h: u32,
+    default_stride: i32,
+    time_secs: f64,
+) -> Result<PreviewFrame> {
+    let target_100ns = (time_secs.max(0.0) * 10_000_000.0) as i64;
+    let pos = PROPVARIANT::from(target_100ns.max(0));
+    let _ = unsafe { reader.SetCurrentPosition(&GUID::zeroed(), &pos) };
 
     let mut chosen_sample: Option<(IMFSample, i64)> = None;
     for _ in 0..90 {

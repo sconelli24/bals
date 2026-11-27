@@ -35,6 +35,7 @@ pub struct AacEncoder {
     pub channels: u16,
     mft_provides_output_samples: bool,
     output_buffer_size: u32,
+    reusable_in_sample: Option<(IMFSample, IMFMediaBuffer, usize)>,
     reusable_out_sample: Option<IMFSample>,
     mf_started: bool,
 }
@@ -133,6 +134,7 @@ impl AacEncoder {
             channels: config.channels,
             mft_provides_output_samples,
             output_buffer_size,
+            reusable_in_sample: None,
             reusable_out_sample: None,
             mf_started: true,
         })
@@ -152,24 +154,33 @@ impl AacEncoder {
         let duration_100ns = (frames as i64 * 10_000_000) / self.sample_rate as i64;
         let byte_len = std::mem::size_of_val(pcm_samples);
 
-        let sample = unsafe { MFCreateSample() }.context("MFCreateSample (PCM) falló")?;
-        let buffer: IMFMediaBuffer = unsafe { MFCreateMemoryBuffer(byte_len as u32) }
-            .context("MFCreateMemoryBuffer (PCM) falló")?;
+        let (sample, buffer, cap) = match self.reusable_in_sample.take() {
+            Some((s, b, c)) if c >= byte_len => (s, b, c),
+            _ => {
+                let s = unsafe { MFCreateSample() }.context("MFCreateSample (PCM) falló")?;
+                let b: IMFMediaBuffer = unsafe { MFCreateMemoryBuffer(byte_len as u32) }
+                    .context("MFCreateMemoryBuffer (PCM) falló")?;
+                unsafe { s.AddBuffer(&b)? };
+                (s, b, byte_len)
+            }
+        };
 
         let mut dst_ptr: *mut u8 = std::ptr::null_mut();
         unsafe { buffer.Lock(&mut dst_ptr, None, None) }?;
-        unsafe {
+        let input_res = unsafe {
             std::ptr::copy_nonoverlapping(pcm_samples.as_ptr() as *const u8, dst_ptr, byte_len);
             buffer.Unlock()?;
             buffer.SetCurrentLength(byte_len as u32)?;
-            sample.AddBuffer(&buffer)?;
             sample.SetSampleTime(pts_100ns)?;
             sample.SetSampleDuration(duration_100ns)?;
             self.mft.ProcessInput(0, &sample, 0)
-        }
-        .context("AAC MFT ProcessInput falló")?;
+        };
 
-        self.drain_outputs()
+        let out_res = input_res
+            .context("AAC MFT ProcessInput falló")
+            .and_then(|()| self.drain_outputs());
+        self.reusable_in_sample = Some((sample, buffer, cap));
+        out_res
     }
 
     pub fn flush(&mut self) -> Result<Vec<EncodedAudioPacket>> {

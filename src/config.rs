@@ -326,6 +326,7 @@ impl CameraCorner {
         CameraCorner::BottomRight,
     ];
 
+    #[allow(dead_code)]
     pub const fn arrow_label(self) -> &'static str {
         match self {
             CameraCorner::TopLeft => "↖",

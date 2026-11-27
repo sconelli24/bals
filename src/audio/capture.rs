@@ -4,6 +4,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
@@ -55,9 +56,16 @@ impl WasapiStream {
             })
             .context("No se pudo crear el hilo de captura WASAPI")?;
 
-        let label = ready_rx
-            .recv()
-            .context("El hilo WASAPI terminó antes de inicializar")??;
+        let label = match ready_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => res?,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                stop.store(true, Ordering::SeqCst);
+                anyhow::bail!("Tiempo de espera agotado al inicializar captura WASAPI");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("El hilo WASAPI terminó antes de inicializar");
+            }
+        };
         info!(source = %label, "Captura de audio WASAPI iniciada (48 kHz estéreo)");
 
         Ok(Self {

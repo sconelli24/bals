@@ -97,9 +97,16 @@ impl AudioPipeline {
             })
             .context("No se pudo iniciar el hilo mezclador/encoder AAC")?;
 
-        let stream_info = info_rx
-            .recv()
-            .context("El hilo encoder AAC terminó antes de inicializar")??;
+        let stream_info = match info_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(res) => res?,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                stop.store(true, Ordering::SeqCst);
+                anyhow::bail!("Tiempo de espera agotado al inicializar el encoder AAC");
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("El hilo encoder AAC terminó antes de inicializar");
+            }
+        };
 
         info!(
             mic_active = mic_stream.is_some(),

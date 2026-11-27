@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
     D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Texture2D,
     ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    ID3D11VideoProcessorOutputView,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
 use windows::core::Interface;
@@ -59,6 +59,8 @@ pub struct GpuNv12Converter {
     supports_multi_stream: bool,
     pool: Vec<Nv12Slot>,
     next_slot: usize,
+    cached_cam_input: Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
+    cached_cam_layout: Option<(u32, u32, CameraCorner, CameraSize)>,
 }
 
 impl GpuNv12Converter {
@@ -126,6 +128,8 @@ impl GpuNv12Converter {
             supports_multi_stream,
             pool,
             next_slot: 0,
+            cached_cam_input: None,
+            cached_cam_layout: None,
         })
     }
 
@@ -210,6 +214,8 @@ impl GpuNv12Converter {
             self.content_max_h = new_max_h;
             self.supports_multi_stream = self.supports_multi_stream && supports_multi_stream;
             self.next_slot = 0;
+            self.cached_cam_input = None;
+            self.cached_cam_layout = None;
         }
 
         let in_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
@@ -238,54 +244,80 @@ impl GpuNv12Converter {
         let mut cam_input_view = None;
         if let Some(cam) = camera.as_ref().filter(|_| self.supports_multi_stream) {
             if cam.width >= 32 && cam.height >= 32 {
-                match unsafe {
-                    self.video_device.CreateVideoProcessorInputView(
-                        cam.texture,
-                        &self.enumerator,
-                        &in_view_desc,
-                        Some(&mut cam_input_view),
-                    )
-                } {
-                    Ok(()) => {
-                        let cam_src = RECT {
-                            left: 0,
-                            top: 0,
-                            right: cam.width as i32,
-                            bottom: cam.height as i32,
-                        };
-                        let cam_dst = compute_camera_pip_rect(
-                            cam.width,
-                            cam.height,
-                            self.output_width,
-                            self.output_height,
-                            cam.corner,
-                            cam.size,
-                        );
-                        let mut cam_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE::default();
-                        cam_cs._bitfield = 0; // RGB Full 0-255
-                        unsafe {
-                            self.video_context.VideoProcessorSetStreamFrameFormat(
-                                &self.processor,
-                                1,
-                                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                let cached_hit = self
+                    .cached_cam_input
+                    .as_ref()
+                    .filter(|(tex, _)| tex.as_raw() == cam.texture.as_raw())
+                    .map(|(_, view)| view.clone());
+
+                let view_res = if let Some(view) = cached_hit {
+                    Ok(view)
+                } else {
+                    let mut created = None;
+                    unsafe {
+                        self.video_device.CreateVideoProcessorInputView(
+                            cam.texture,
+                            &self.enumerator,
+                            &in_view_desc,
+                            Some(&mut created),
+                        )
+                    }
+                    .and_then(|()| {
+                        created.ok_or_else(|| {
+                            windows::core::Error::from(windows::Win32::Foundation::E_FAIL)
+                        })
+                    })
+                    .inspect(|view| {
+                        self.cached_cam_input = Some((cam.texture.clone(), view.clone()));
+                    })
+                };
+
+                match view_res {
+                    Ok(view) => {
+                        cam_input_view = Some(view);
+                        let layout_key = (cam.width, cam.height, cam.corner, cam.size);
+                        if self.cached_cam_layout != Some(layout_key) {
+                            let cam_src = RECT {
+                                left: 0,
+                                top: 0,
+                                right: cam.width as i32,
+                                bottom: cam.height as i32,
+                            };
+                            let cam_dst = compute_camera_pip_rect(
+                                cam.width,
+                                cam.height,
+                                self.output_width,
+                                self.output_height,
+                                cam.corner,
+                                cam.size,
                             );
-                            self.video_context.VideoProcessorSetStreamSourceRect(
-                                &self.processor,
-                                1,
-                                true,
-                                Some(&cam_src),
-                            );
-                            self.video_context.VideoProcessorSetStreamDestRect(
-                                &self.processor,
-                                1,
-                                true,
-                                Some(&cam_dst),
-                            );
-                            self.video_context.VideoProcessorSetStreamColorSpace(
-                                &self.processor,
-                                1,
-                                &cam_cs,
-                            );
+                            let mut cam_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE::default();
+                            cam_cs._bitfield = 0; // RGB Full 0-255
+                            unsafe {
+                                self.video_context.VideoProcessorSetStreamFrameFormat(
+                                    &self.processor,
+                                    1,
+                                    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                                );
+                                self.video_context.VideoProcessorSetStreamSourceRect(
+                                    &self.processor,
+                                    1,
+                                    true,
+                                    Some(&cam_src),
+                                );
+                                self.video_context.VideoProcessorSetStreamDestRect(
+                                    &self.processor,
+                                    1,
+                                    true,
+                                    Some(&cam_dst),
+                                );
+                                self.video_context.VideoProcessorSetStreamColorSpace(
+                                    &self.processor,
+                                    1,
+                                    &cam_cs,
+                                );
+                            }
+                            self.cached_cam_layout = Some(layout_key);
                         }
                     }
                     Err(err) => {
@@ -293,10 +325,15 @@ impl GpuNv12Converter {
                             "CreateVideoProcessorInputView para cámara falló ({err}); continuando solo con el juego"
                         );
                         self.supports_multi_stream = false;
+                        self.cached_cam_input = None;
+                        self.cached_cam_layout = None;
                         cam_input_view = None;
                     }
                 }
             }
+        } else {
+            self.cached_cam_input = None;
+            self.cached_cam_layout = None;
         }
 
         let slot = &self.pool[self.next_slot];

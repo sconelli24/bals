@@ -4,6 +4,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use tracing::debug;
 use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
@@ -17,38 +18,43 @@ pub struct AudioLevelMonitor {
     desktop_peak: Arc<AtomicU32>,
     mic_peak: Arc<AtomicU32>,
     paused: Arc<AtomicBool>,
+    mic_enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     desktop_handle: Option<JoinHandle<()>>,
     mic_handle: Option<JoinHandle<()>>,
 }
 
 impl AudioLevelMonitor {
-    pub fn start() -> Self {
+    pub fn start(mic_enabled_init: bool) -> Self {
         let desktop_peak = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         let mic_peak = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         let paused = Arc::new(AtomicBool::new(false));
+        let mic_enabled = Arc::new(AtomicBool::new(mic_enabled_init));
         let stop = Arc::new(AtomicBool::new(false));
 
         let d_peak = Arc::clone(&desktop_peak);
         let d_paused = Arc::clone(&paused);
+        let d_mic = Arc::clone(&mic_enabled);
         let d_stop = Arc::clone(&stop);
         let desktop_handle = thread::Builder::new()
             .name("bals-vu-desktop".to_string())
-            .spawn(move || monitor_loop(Direction::Render, d_peak, d_paused, d_stop))
+            .spawn(move || monitor_loop(Direction::Render, d_peak, d_paused, d_mic, d_stop))
             .ok();
 
         let m_peak = Arc::clone(&mic_peak);
         let m_paused = Arc::clone(&paused);
+        let m_mic = Arc::clone(&mic_enabled);
         let m_stop = Arc::clone(&stop);
         let mic_handle = thread::Builder::new()
             .name("bals-vu-mic".to_string())
-            .spawn(move || monitor_loop(Direction::Capture, m_peak, m_paused, m_stop))
+            .spawn(move || monitor_loop(Direction::Capture, m_peak, m_paused, m_mic, m_stop))
             .ok();
 
         Self {
             desktop_peak,
             mic_peak,
             paused,
+            mic_enabled,
             stop,
             desktop_handle,
             mic_handle,
@@ -58,6 +64,11 @@ impl AudioLevelMonitor {
     /// Reduce cadencia de lectura cuando la ventana no está enfocada o no requiere refresco fino.
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// Evita procesar muestras de micrófono cuando el usuario lo tiene desactivado.
+    pub fn set_mic_enabled(&self, enabled: bool) {
+        self.mic_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Nivel instantáneo suavizado del audio de escritorio/juego (`0.0..=1.0`).
@@ -87,6 +98,7 @@ fn monitor_loop(
     device_dir: Direction,
     level_out: Arc<AtomicU32>,
     paused: Arc<AtomicBool>,
+    mic_enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     let _ = wasapi::initialize_mta();
@@ -126,10 +138,33 @@ fn monitor_loop(
 
     let mut raw: VecDeque<u8> = VecDeque::with_capacity(8192);
     let mut smoothed = 0.0f32;
+    let mut was_sleeping = false;
 
     while !stop.load(Ordering::Relaxed) {
-        let wait_ms = if paused.load(Ordering::Relaxed) { 120 } else { 30 };
-        let _ = h_event.wait_for_event(wait_ms);
+        let should_sleep = paused.load(Ordering::Relaxed)
+            || (device_dir == Direction::Capture && !mic_enabled.load(Ordering::Relaxed));
+        if should_sleep {
+            if smoothed != 0.0 {
+                smoothed = 0.0;
+                level_out.store(0.0f32.to_bits(), Ordering::Relaxed);
+            }
+            was_sleeping = true;
+            thread::sleep(Duration::from_millis(120));
+            continue;
+        }
+
+        if was_sleeping {
+            was_sleeping = false;
+            // Descartar backlog acumulado durante la pausa antes de volver a medir.
+            while matches!(capture.get_next_packet_size(), Ok(Some(n)) if n > 0) {
+                if capture.read_from_device_to_deque(&mut raw).is_err() {
+                    break;
+                }
+                raw.clear();
+            }
+        }
+
+        let _ = h_event.wait_for_event(30);
         if stop.load(Ordering::Relaxed) {
             break;
         }

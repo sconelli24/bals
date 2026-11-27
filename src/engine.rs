@@ -8,11 +8,12 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-    ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
+    D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_WRITE, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Threading::{
     CreateWaitableTimerExW, GetCurrentThread, SetThreadPriority, SetWaitableTimer,
@@ -196,9 +197,12 @@ struct ActiveSession {
     audio: Option<AudioPipeline>,
     /// Fuente opcional de webcam (solo abierta cuando `camera_cfg.enabled == true`).
     camera: Option<CameraCapture>,
+    pending_camera: Option<(u64, Receiver<Result<CameraCapture>>)>,
+    camera_gen: u64,
     camera_cfg: CameraConfig,
-    /// Textura GPU + anillo staging (2 slots) para subir frames de webcam sin renombrado interno del driver.
+    /// Textura GPU + anillo staging (3 slots) para subir frames de webcam sin bloquear a la GPU.
     cam_gpu_upload: Option<CameraGpuUpload>,
+    last_recapture_attempt: Option<Instant>,
     /// Último frame del juego/monitor retenido para recomponer cámara incluso en pantallas estáticas.
     last_game_frame: Option<CapturedFrame>,
     /// Fuerza recomposición NV12 al cambiar esquina/tamaño/espejo/estirado 4:3 en caliente.
@@ -254,20 +258,15 @@ impl ActiveSession {
         let encoder_label = encoder.hardware_label();
 
         let camera_cfg = cfg.camera_config();
-        let camera = if camera_cfg.enabled {
-            match CameraCapture::start(
-                camera_cfg.device_id.as_deref(),
+        let (camera_gen, pending_camera) = if camera_cfg.enabled {
+            let rx = CameraCapture::spawn_async(
+                camera_cfg.device_id.clone(),
                 camera_cfg.mirror,
                 camera_cfg.preset,
-            ) {
-                Ok(cam) => Some(cam),
-                Err(err) => {
-                    warn!("Cámara no disponible ({err:#}); grabando sin superposición de cámara");
-                    None
-                }
-            }
+            );
+            (1u64, Some((1u64, rx)))
         } else {
-            None
+            (0u64, None)
         };
 
         let max_bytes = cfg.max_buffer_ram_mb.max(32) * 1024 * 1024;
@@ -317,9 +316,12 @@ impl ActiveSession {
             encoder,
             encoder_label,
             audio,
-            camera,
+            camera: None,
+            pending_camera,
+            camera_gen,
             camera_cfg,
             cam_gpu_upload: None,
+            last_recapture_attempt: None,
             last_game_frame: None,
             layout_dirty: false,
             stretch_aspect_ratio: cfg.stretch_aspect_ratio,
@@ -367,13 +369,15 @@ impl ActiveSession {
         }
 
         if !new_cam.enabled {
+            self.camera_gen += 1;
+            self.pending_camera = None;
             if self.camera.take().is_some() {
                 info!("Cámara desactivada en vivo (LED apagado, 0% CPU/GPU)");
             }
             self.cam_gpu_upload = None;
             self.layout_dirty = true;
         } else {
-            let needs_reopen = self.camera.is_none()
+            let needs_reopen = (self.camera.is_none() && self.pending_camera.is_none())
                 || new_cam.device_id != self.camera_cfg.device_id
                 || new_cam.preset != self.camera_cfg.preset
                 || self.camera.as_ref().is_some_and(|c| !c.is_alive());
@@ -381,22 +385,19 @@ impl ActiveSession {
             if needs_reopen {
                 self.camera = None;
                 self.cam_gpu_upload = None;
-                match CameraCapture::start(
-                    new_cam.device_id.as_deref(),
+                self.camera_gen += 1;
+                let cam_gen = self.camera_gen;
+                let rx = CameraCapture::spawn_async(
+                    new_cam.device_id.clone(),
                     new_cam.mirror,
                     new_cam.preset,
-                ) {
-                    Ok(cam) => {
-                        self.camera = Some(cam);
-                        self.layout_dirty = true;
+                );
+                self.pending_camera = Some((cam_gen, rx));
+            } else {
+                if let Some(cam) = &self.camera {
+                    if new_cam.mirror != self.camera_cfg.mirror {
+                        cam.set_mirror(new_cam.mirror);
                     }
-                    Err(err) => {
-                        warn!("No se pudo activar la cámara en vivo ({err:#})");
-                    }
-                }
-            } else if let Some(cam) = &self.camera {
-                if new_cam.mirror != self.camera_cfg.mirror {
-                    cam.set_mirror(new_cam.mirror);
                 }
                 if new_cam.corner != self.camera_cfg.corner || new_cam.size != self.camera_cfg.size {
                     self.layout_dirty = true;
@@ -408,6 +409,33 @@ impl ActiveSession {
     }
 
     fn poll_camera_frame(&mut self) -> bool {
+        let mut newly_connected = false;
+        if let Some((cam_gen, rx)) = &self.pending_camera {
+            match rx.try_recv() {
+                Ok(res) => {
+                    let expected_gen = *cam_gen;
+                    self.pending_camera = None;
+                    if expected_gen == self.camera_gen && self.camera_cfg.enabled {
+                        match res {
+                            Ok(cam) => {
+                                cam.set_mirror(self.camera_cfg.mirror);
+                                self.camera = Some(cam);
+                                self.layout_dirty = true;
+                                newly_connected = true;
+                            }
+                            Err(err) => {
+                                warn!("Cámara no disponible ({err:#}); grabando sin superposición de cámara");
+                            }
+                        }
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.pending_camera = None;
+                }
+            }
+        }
+
         if self.camera.as_ref().is_some_and(|c| !c.is_alive()) {
             warn!("La cámara se desconectó; continuando grabación sin superposición de cámara");
             self.camera = None;
@@ -416,7 +444,7 @@ impl ActiveSession {
         }
 
         let Some(fresh_cam) = self.camera.as_ref().and_then(|c| c.take_latest()) else {
-            return false;
+            return newly_connected;
         };
 
         let upload_res = upload_camera_frame_to_gpu(&self.d3d, &mut self.cam_gpu_upload, &fresh_cam);
@@ -427,18 +455,58 @@ impl ActiveSession {
         }
 
         match upload_res {
-            Ok(()) => true,
+            Ok(uploaded) => uploaded || newly_connected,
             Err(err) => {
                 warn!("No se pudo subir frame de webcam a VRAM ({err:#})");
-                false
+                newly_connected
             }
         }
+    }
+
+    fn try_resume_from_pause(&mut self) -> bool {
+        // Si la captura se había soltado durante el Alt-Tab o error transitorio, re-engancharla
+        // manteniendo intacto todo el ReplayBuffer (con backoff de 500 ms para no saturar CPU/D3D11).
+        if self.capture.is_none() {
+            if self
+                .last_recapture_attempt
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+            {
+                return false;
+            }
+            self.last_recapture_attempt = Some(Instant::now());
+            if let Ok(new_cap) = FrameCapture::start(
+                &self.d3d,
+                self.capture_target,
+                self.capture_cursor,
+                self.prefer_dxgi,
+            ) {
+                self.capture_backend = new_cap.backend_label();
+                self.capture = Some(new_cap);
+                self.last_recapture_attempt = None;
+            } else {
+                return false;
+            }
+        }
+
+        if let Some(since) = self.paused_since_100ns.take() {
+            self.total_paused_100ns += (clock::now_100ns() - since).max(0);
+        }
+        if let RecordingState::RecordingGame { paused_alt_tab, .. } = &mut self.state {
+            *paused_alt_tab = false;
+        }
+        self.encoder.force_keyframe();
+        self.last_wgc_frame_at = Instant::now();
+        debug!("Reanudando ReplayBuffer sin pérdida");
+        true
     }
 
     /// Evalúa si el juego está minimizado o en Alt-Tab sin frames activos.
     /// Devuelve `true` si cambió el estado de pausa (para refrescar la bandeja).
     fn update_alt_tab_pause(&mut self) -> bool {
         let Some(hwnd) = self.target_hwnd else {
+            if self.paused_since_100ns.is_some() {
+                return self.try_resume_from_pause();
+            }
             return false;
         };
 
@@ -478,32 +546,7 @@ impl ActiveSession {
         }
 
         if !should_pause && self.paused_since_100ns.is_some() {
-            // Si la captura se había soltado durante el Alt-Tab (ej. fullscreen exclusivo), re-engancharla
-            // manteniendo intacto todo el ReplayBuffer.
-            if self.capture.is_none() {
-                if let Ok(new_cap) = FrameCapture::start(
-                    &self.d3d,
-                    self.capture_target,
-                    self.capture_cursor,
-                    self.prefer_dxgi,
-                ) {
-                    self.capture_backend = new_cap.backend_label();
-                    self.capture = Some(new_cap);
-                } else {
-                    return false;
-                }
-            }
-
-            if let Some(since) = self.paused_since_100ns.take() {
-                self.total_paused_100ns += (clock::now_100ns() - since).max(0);
-            }
-            if let RecordingState::RecordingGame { paused_alt_tab, .. } = &mut self.state {
-                *paused_alt_tab = false;
-            }
-            self.encoder.force_keyframe();
-            self.last_wgc_frame_at = Instant::now();
-            debug!("Juego de vuelta en primer plano; reanudando ReplayBuffer sin pérdida");
-            return true;
+            return self.try_resume_from_pause();
         }
 
         false
@@ -693,6 +736,8 @@ fn engine_loop(
     let mut session: Option<ActiveSession> = None;
     let mut last_game_poll = Instant::now() - Duration::from_secs(10);
     let mut last_status_publish = Instant::now();
+    let mut manual_paused_by_user = false;
+    let mut last_manual_retry = Instant::now();
 
     // Si el usuario eligió grabar un monitor completo, iniciar la captura automáticamente al arrancar.
     if cfg.capture_mode == CaptureMode::ManualMonitor {
@@ -721,10 +766,12 @@ fn engine_loop(
                     break;
                 }
                 EngineCommand::StartManual => {
+                    manual_paused_by_user = false;
                     start_manual_session(&cfg, &mut session);
                     publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
                 EngineCommand::Stop => {
+                    manual_paused_by_user = true;
                     if session.take().is_some() {
                         info!("Grabación detenida (GPU y VRAM liberadas al 100%)");
                         publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
@@ -733,8 +780,10 @@ fn engine_loop(
                 EngineCommand::ToggleManual => {
                     if session.is_some() {
                         session = None;
+                        manual_paused_by_user = true;
                         info!("Grabación pausada manualmente (GPU liberada)");
                     } else {
+                        manual_paused_by_user = false;
                         start_manual_session(&cfg, &mut session);
                     }
                     publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
@@ -746,6 +795,9 @@ fn engine_loop(
                     config: new_cfg,
                     persist_to_disk,
                 } => {
+                    if new_cfg.capture_mode != cfg.capture_mode {
+                        manual_paused_by_user = false;
+                    }
                     apply_config_update(
                         &mut cfg,
                         new_cfg,
@@ -781,36 +833,57 @@ fn engine_loop(
                 Err(err) => {
                     warn!("La sesión de captura se cerró ({err:#}); pasando a reposo");
                     session = None;
+                    last_manual_retry = Instant::now();
                     publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
             }
-        } else if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(200)) {
-            match cmd {
-                EngineCommand::Shutdown => break,
-                EngineCommand::StartManual | EngineCommand::ToggleManual => {
-                    start_manual_session(&cfg, &mut session);
+        } else {
+            if cfg.capture_mode == CaptureMode::ManualMonitor
+                && !manual_paused_by_user
+                && last_manual_retry.elapsed() >= Duration::from_millis(1500)
+            {
+                last_manual_retry = Instant::now();
+                start_manual_session(&cfg, &mut session);
+                if session.is_some() {
                     publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
                 }
-                EngineCommand::Stop => {}
-                EngineCommand::SaveClip => {
-                    let msg = "No hay grabación activa. Inicia un juego o activa el modo manual.";
-                    record_and_publish_event(&session, &cfg, &telemetry, msg, true);
-                    let _ = event_tx.send(EngineEvent::ClipFailed(msg.to_string()));
-                }
-                EngineCommand::UpdateConfig {
-                    config: new_cfg,
-                    persist_to_disk,
-                } => {
-                    apply_config_update(
-                        &mut cfg,
-                        new_cfg,
-                        persist_to_disk,
-                        &mut session,
-                        &mut last_game_poll,
-                        &shared_status,
-                        &event_tx,
-                        &telemetry,
-                    );
+            }
+            if session.is_none() {
+                if let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(200)) {
+                    match cmd {
+                        EngineCommand::Shutdown => break,
+                        EngineCommand::StartManual | EngineCommand::ToggleManual => {
+                            manual_paused_by_user = false;
+                            start_manual_session(&cfg, &mut session);
+                            publish_status(&session, &cfg, &shared_status, &event_tx, &telemetry);
+                        }
+                        EngineCommand::Stop => {
+                            manual_paused_by_user = true;
+                        }
+                        EngineCommand::SaveClip => {
+                            let msg = "No hay grabación activa. Inicia un juego o activa el modo manual.";
+                            record_and_publish_event(&session, &cfg, &telemetry, msg, true);
+                            let _ = event_tx.send(EngineEvent::ClipFailed(msg.to_string()));
+                        }
+                        EngineCommand::UpdateConfig {
+                            config: new_cfg,
+                            persist_to_disk,
+                        } => {
+                            if new_cfg.capture_mode != cfg.capture_mode {
+                                manual_paused_by_user = false;
+                            }
+                            apply_config_update(
+                                &mut cfg,
+                                new_cfg,
+                                persist_to_disk,
+                                &mut session,
+                                &mut last_game_poll,
+                                &shared_status,
+                                &event_tx,
+                                &telemetry,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1241,7 +1314,7 @@ fn publish_status(
 
 struct CameraGpuUpload {
     gpu_tex: ID3D11Texture2D,
-    staging_ring: [ID3D11Texture2D; 2],
+    staging_ring: [ID3D11Texture2D; 3],
     next_staging: usize,
     width: u32,
     height: u32,
@@ -1274,7 +1347,7 @@ fn upload_camera_frame_to_gpu(
     d3d: &SharedD3DDevice,
     slot: &mut Option<CameraGpuUpload>,
     frame: &crate::capture::camera::CameraFrame,
-) -> Result<()> {
+) -> Result<bool> {
     let needs_new = slot
         .as_ref()
         .is_none_or(|up| up.width != frame.width || up.height != frame.height);
@@ -1317,16 +1390,20 @@ fn upload_camera_frame_to_gpu(
         };
         let mut st0 = None;
         let mut st1 = None;
+        let mut st2 = None;
         unsafe { d3d.device.CreateTexture2D(&staging_desc, None, Some(&mut st0)) }
             .context("CreateTexture2D (webcam staging 0) falló")?;
         unsafe { d3d.device.CreateTexture2D(&staging_desc, None, Some(&mut st1)) }
             .context("CreateTexture2D (webcam staging 1) falló")?;
+        unsafe { d3d.device.CreateTexture2D(&staging_desc, None, Some(&mut st2)) }
+            .context("CreateTexture2D (webcam staging 2) falló")?;
 
         *slot = Some(CameraGpuUpload {
             gpu_tex,
             staging_ring: [
                 st0.context("staging 0 None")?,
                 st1.context("staging 1 None")?,
+                st2.context("staging 2 None")?,
             ],
             next_staging: 0,
             width: frame.width,
@@ -1336,14 +1413,27 @@ fn upload_camera_frame_to_gpu(
 
     if let Some(up) = slot.as_mut() {
         let staging = &up.staging_ring[up.next_staging];
-        up.next_staging = (up.next_staging + 1) % up.staging_ring.len();
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            d3d.context
-                .Map(staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped))
+        match unsafe {
+            d3d.context.Map(
+                staging,
+                0,
+                D3D11_MAP_WRITE,
+                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                Some(&mut mapped),
+            )
+        } {
+            Ok(()) => {}
+            Err(err) if err.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
+                // La GPU sigue usando este slot; omitir este frame de webcam sin provocar stall.
+                up.next_staging = (up.next_staging + 1) % up.staging_ring.len();
+                return Ok(false);
+            }
+            Err(err) => return Err(err).context("Map (webcam staging) falló"),
         }
-        .context("Map (webcam staging) falló")?;
+
+        up.next_staging = (up.next_staging + 1) % up.staging_ring.len();
 
         let row_bytes = (frame.width as usize) * 4;
         let dst_pitch = mapped.RowPitch as usize;
@@ -1372,5 +1462,5 @@ fn upload_camera_frame_to_gpu(
         }
     }
 
-    Ok(())
+    Ok(true)
 }

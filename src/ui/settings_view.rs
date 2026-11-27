@@ -8,8 +8,8 @@ use crate::config::{
 };
 use crate::ui::theme::RetroPalette;
 use crate::ui::widgets::{
-    SectionIcon, draw_led_vu_meter, retro_card, retro_card_custom_header, retro_checkbox,
-    retro_pill,
+    SectionIcon, draw_camera_corner_button, draw_led_vu_meter, retro_card,
+    retro_card_custom_header, retro_checkbox, retro_pill, retro_save_button,
 };
 use crate::ui::{BalsUiApp, UpdateUiState, open_in_shell};
 use crate::updater::{CURRENT_VERSION, ReleaseInfo};
@@ -80,12 +80,29 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
 
             ui.add_space(2.0);
 
-            // FPS (2 píldoras) + Calidad QVBR (3 píldoras)
-            ui.label(egui::RichText::new("FPS Y CALIDAD (QVBR)").size(10.0).color(p.crt_muted));
-            let gap = 4.0;
-            let usable = row_w - sp * 4.0 - gap;
+            // FPS (2 píldoras) | Calidad QVBR (3 píldoras) con separador visual claro
+            let sep_w = 9.0;
+            let usable = row_w - sp * 4.0 - sep_w;
             let w_fps_btn = ((usable * 0.36) / 2.0).max(52.0);
-            let w_qual = ((usable - w_fps_btn * 2.0) / 3.0).max(60.0);
+            let w_qual = ((usable - w_fps_btn * 2.0) / 3.0).max(58.0);
+            let fps_group_w = w_fps_btn * 2.0 + sp;
+
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    vec2(fps_group_w, 13.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(egui::RichText::new("FPS").size(10.2).color(p.crt_muted));
+                    },
+                );
+                ui.add_space(sep_w);
+                ui.label(
+                    egui::RichText::new("CALIDAD (QVBR)")
+                        .size(10.2)
+                        .color(p.crt_muted),
+                );
+            });
+
             ui.horizontal(|ui| {
                 if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps30, "30 FPS", vec2(w_fps_btn, 22.0)).clicked() {
                     app.cfg.fps = FrameRate::Fps30;
@@ -93,7 +110,16 @@ fn render_video_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
                 if retro_pill(ui, p, app.cfg.fps == FrameRate::Fps60, "60 FPS", vec2(w_fps_btn, 22.0)).clicked() {
                     app.cfg.fps = FrameRate::Fps60;
                 }
-                ui.add_space(gap);
+
+                let (sep_rect, _) = ui.allocate_exact_size(vec2(sep_w, 22.0), egui::Sense::hover());
+                ui.painter().line_segment(
+                    [
+                        pos2(sep_rect.center().x, sep_rect.top() + 3.0),
+                        pos2(sep_rect.center().x, sep_rect.bottom() - 3.0),
+                    ],
+                    Stroke::new(1.0, p.crt_widget_hover),
+                );
+
                 if retro_pill(
                     ui,
                     p,
@@ -450,7 +476,7 @@ fn render_capture_hotkey_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroP
                                 .color(p.crt_muted),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if retro_pill(ui, p, false, "ACT", vec2(38.0, 18.0))
+                            if retro_pill(ui, p, false, "RECARGAR", vec2(74.0, 20.0))
                                 .on_hover_text("Volver a detectar monitores conectados")
                                 .clicked()
                             {
@@ -588,6 +614,7 @@ fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
     };
 
     let cam_enabled = app.cfg.camera_enabled;
+    let cameras_loading = app.cameras_loading;
     let active_cam_presets = active_cam_idx.map(|i| app.cameras[i].supported_presets.clone());
     let resolved_preset =
         active_cam_idx.and_then(|i| app.cameras[i].resolve_preset(app.cfg.camera_preset));
@@ -601,18 +628,22 @@ fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
         |ui| {
             if !cam_enabled {
                 ui.label(egui::RichText::new("OFF · 0% CPU").size(11.0).color(p.amber));
+            } else if cameras_loading && active_cam_idx.is_none() {
+                ui.label(egui::RichText::new("BUSCANDO...").size(10.5).color(p.amber));
             } else if active_cam_idx.is_some() {
-                let preset_txt = resolved_preset
-                    .map(|pr| format!("PiP · {}", pr.label()))
-                    .unwrap_or_else(|| "PiP · AUTO".to_string());
                 let presets = active_cam_presets.as_deref().unwrap_or(&[]);
                 let has_multiple = presets.len() > 1;
+                let preset_txt = match (resolved_preset, has_multiple) {
+                    (Some(pr), true) => format!("{} ▾", pr.label()),
+                    (Some(pr), false) => pr.label(),
+                    (None, _) => "AUTO".to_string(),
+                };
                 let hover = if has_multiple {
                     let list = presets
                         .iter()
                         .map(|pr| pr.label())
                         .collect::<Vec<_>>()
-                        .join(" → ");
+                        .join(" -> ");
                     format!("Clic para cambiar resolución y FPS de la cámara\nDisponibles: {list}")
                 } else if let Some(only) = resolved_preset {
                     format!("Único formato disponible en esta cámara: {}", only.label())
@@ -620,7 +651,7 @@ fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                     "Formato automático detectado por la cámara".to_string()
                 };
 
-                let pill_w = (preset_txt.chars().count() as f32 * 6.8 + 14.0).max(82.0);
+                let pill_w = (preset_txt.chars().count() as f32 * 7.0 + 16.0).max(72.0);
                 if retro_pill(ui, p, has_multiple, &preset_txt, vec2(pill_w, 19.0))
                     .on_hover_text(hover)
                     .clicked()
@@ -635,15 +666,15 @@ fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
         |ui| {
             let sp = ui.spacing().item_spacing.x;
 
-            // Fila 1: Toggle activar + selector de dispositivo + botón refrescar USB
+            // Fila 1: Toggle activar + selector de dispositivo + botón buscar USB
             ui.horizontal(|ui| {
                 retro_checkbox(ui, p, &mut app.cfg.camera_enabled, "ACTIVAR")
                     .on_hover_text("Incluye la webcam en el clip (se aplica en vivo sin perder el buffer)");
 
                 ui.add_space(4.0);
 
-                let act_w = 38.0;
-                let dev_w = (ui.available_width() - act_w - sp).max(110.0);
+                let act_w = 58.0;
+                let dev_w = (ui.available_width() - act_w - sp).max(100.0);
 
                 if let Some(current_idx) = active_cam_idx {
                     let current = &app.cameras[current_idx];
@@ -674,37 +705,45 @@ fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                             app.cameras[next].resolve_preset(app.cfg.camera_preset);
                     }
                 } else {
+                    let status_lbl = if app.cameras_loading {
+                        "Buscando cámaras..."
+                    } else {
+                        "Sin cámaras detectadas"
+                    };
                     ui.add_sized(
                         vec2(dev_w, 20.0),
                         egui::Label::new(
-                            egui::RichText::new("Sin cámaras detectadas")
+                            egui::RichText::new(status_lbl)
                                 .size(10.5)
                                 .color(p.crt_muted),
                         ),
                     );
                 }
 
-                if retro_pill(ui, p, false, "ACT", vec2(act_w, 21.0))
-                    .on_hover_text("Volver a detectar cámaras USB conectadas")
-                    .clicked()
-                {
-                    app.refresh_cameras();
-                }
+                ui.add_enabled_ui(!app.cameras_loading, |ui| {
+                    let btn_lbl = if app.cameras_loading { "..." } else { "BUSCAR" };
+                    if retro_pill(ui, p, false, btn_lbl, vec2(act_w, 21.0))
+                        .on_hover_text("Volver a detectar cámaras USB conectadas")
+                        .clicked()
+                    {
+                        app.refresh_cameras();
+                    }
+                });
             });
 
             ui.add_space(4.0);
 
-            // Fila 2: 4 esquinas + 3 tamaños (S/M/L) + Espejo (habilitado cuando la cámara está activa)
+            // Fila 2: selector visual de 4 esquinas + 3 tamaños (S/M/L) + Espejo
             ui.add_enabled_ui(app.cfg.camera_enabled, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().item_spacing.x = 3.5;
+                    ui.label(egui::RichText::new("POS:").size(10.0).color(p.crt_muted));
                     for corner in CameraCorner::ALL {
-                        if retro_pill(
+                        if draw_camera_corner_button(
                             ui,
                             p,
+                            corner,
                             app.cfg.camera_corner == corner,
-                            corner.arrow_label(),
-                            vec2(26.0, 21.0),
                         )
                         .on_hover_text(format!("Esquina: {}", corner.description()))
                         .clicked()
@@ -713,15 +752,15 @@ fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                         }
                     }
 
-                    ui.add_space(6.0);
-
+                    ui.add_space(5.0);
+                    ui.label(egui::RichText::new("TAM:").size(10.0).color(p.crt_muted));
                     for size in CameraSize::ALL {
                         if retro_pill(
                             ui,
                             p,
                             app.cfg.camera_size == size,
                             size.short_label(),
-                            vec2(26.0, 21.0),
+                            vec2(24.0, 22.0),
                         )
                         .on_hover_text(format!("Tamaño: {}", size.description()))
                         .clicked()
@@ -730,7 +769,7 @@ fn render_camera_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
                         }
                     }
 
-                    ui.add_space(6.0);
+                    ui.add_space(5.0);
 
                     retro_checkbox(ui, p, &mut app.cfg.camera_mirror, "Espejo")
                         .on_hover_text("Invierte horizontalmente la imagen de la webcam");
@@ -756,12 +795,81 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
 }
 
 fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) {
-    retro_card(
+    enum UpdaterSnapshot {
+        Idle,
+        Checking,
+        UpToDate,
+        Available(ReleaseInfo),
+        Downloading,
+        Error(String),
+    }
+
+    let upd_snap = app
+        .update_state
+        .lock()
+        .map(|st| match &*st {
+            UpdateUiState::Idle => UpdaterSnapshot::Idle,
+            UpdateUiState::Checking => UpdaterSnapshot::Checking,
+            UpdateUiState::UpToDate => UpdaterSnapshot::UpToDate,
+            UpdateUiState::Available(info) => UpdaterSnapshot::Available(info.clone()),
+            UpdateUiState::Downloading => UpdaterSnapshot::Downloading,
+            UpdateUiState::Error(e) => UpdaterSnapshot::Error(e.clone()),
+        })
+        .unwrap_or(UpdaterSnapshot::Idle);
+
+    if matches!(
+        upd_snap,
+        UpdaterSnapshot::Checking | UpdaterSnapshot::Downloading
+    ) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(120));
+    }
+
+    let (badge_txt, badge_col, badge_hover) = match &upd_snap {
+        UpdaterSnapshot::Idle => (format!("v{CURRENT_VERSION}"), p.amber, None),
+        UpdaterSnapshot::Checking => (
+            format!("v{CURRENT_VERSION} · BUSCANDO..."),
+            p.amber,
+            Some("Consultando GitHub Releases..."),
+        ),
+        UpdaterSnapshot::UpToDate => (
+            format!("v{CURRENT_VERSION} · AL DÍA"),
+            p.accent,
+            Some("Ya tienes la última versión disponible"),
+        ),
+        UpdaterSnapshot::Available(info) => (
+            format!("v{CURRENT_VERSION} -> v{}", info.version),
+            p.accent_bright,
+            Some("Nueva versión lista para instalar"),
+        ),
+        UpdaterSnapshot::Downloading => (
+            format!("v{CURRENT_VERSION} · BAJANDO..."),
+            p.amber,
+            Some("Descargando actualización..."),
+        ),
+        UpdaterSnapshot::Error(e) => (
+            format!("v{CURRENT_VERSION} · ERR"),
+            p.led_red,
+            Some(e.as_str()),
+        ),
+    };
+
+    let dirty = app.has_unsaved_changes();
+    let mut do_save = false;
+    let mut do_check_updates = false;
+    let mut pending_install: Option<ReleaseInfo> = None;
+
+    retro_card_custom_header(
         ui,
         p,
         Some(SectionIcon::System),
         "SISTEMA Y TEMA",
-        Some(&format!("v{CURRENT_VERSION}")),
+        |ui| {
+            let lbl = ui.label(egui::RichText::new(&badge_txt).size(10.8).color(badge_col));
+            if let Some(hover) = badge_hover {
+                lbl.on_hover_text(hover);
+            }
+        },
         |ui| {
             let sp = ui.spacing().item_spacing.x;
 
@@ -808,83 +916,70 @@ fn render_system_card(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette) 
 
             ui.add_space(6.0);
 
-            // Botón principal GUARDAR (sin corchetes) + Auto-updater
+            // Botón principal GUARDAR (vectorial, altura fija) + Auto-updater integrado
             let avail_w = ui.available_width();
             ui.horizontal(|ui| {
-                let save_w = ((avail_w - sp) * 0.62).max(165.0);
-                if retro_pill(ui, p, true, "GUARDAR", vec2(save_w, 30.0))
-                    .on_hover_text("Guarda config.toml y aplica al instante (Ctrl+S)")
+                let save_w = ((avail_w - sp) * 0.60).max(165.0);
+                let save_hover = if dirty {
+                    "Tienes cambios sin aplicar — clic o Ctrl+S para guardar"
+                } else {
+                    "Todos los ajustes están guardados y aplicados (Ctrl+S)"
+                };
+                if retro_save_button(ui, p, dirty, vec2(save_w, 30.0))
+                    .on_hover_text(save_hover)
                     .clicked()
                 {
-                    app.save_config();
+                    do_save = true;
                 }
 
-                let upd_w = (avail_w - save_w - sp).max(86.0);
-                if retro_pill(ui, p, false, "UPDATES", vec2(upd_w, 30.0))
-                    .on_hover_text("Buscar nueva versión en GitHub Releases")
-                    .clicked()
-                {
-                    app.check_for_updates();
-                }
-            });
-
-            // Estado del auto-updater
-            let mut pending_install: Option<ReleaseInfo> = None;
-            if let Ok(st) = app.update_state.lock() {
-                match &*st {
-                    UpdateUiState::Idle => {}
-                    UpdateUiState::Checking => {
-                        ui.label(
-                            egui::RichText::new("Consultando GitHub Releases...")
-                                .size(10.5)
-                                .color(p.amber),
-                        );
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(120));
-                    }
-                    UpdateUiState::UpToDate => {
-                        ui.label(
-                            egui::RichText::new(format!("OK: Última versión (v{CURRENT_VERSION})"))
-                                .size(10.5)
-                                .color(p.accent),
-                        );
-                    }
-                    UpdateUiState::Available(info) => {
+                let upd_w = (avail_w - save_w - sp).max(96.0);
+                match &upd_snap {
+                    UpdaterSnapshot::Available(info) => {
                         if retro_pill(
                             ui,
                             p,
                             true,
                             &format!("INSTALAR v{}", info.version),
-                            vec2(ui.available_width(), 24.0),
+                            vec2(upd_w, 30.0),
                         )
+                        .on_hover_text("Descargar e instalar la nueva versión")
                         .clicked()
                         {
                             pending_install = Some(info.clone());
                         }
                     }
-                    UpdateUiState::Downloading => {
-                        ui.label(
-                            egui::RichText::new("Descargando actualización...")
-                                .size(10.5)
-                                .color(p.amber),
-                        );
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(120));
+                    UpdaterSnapshot::Checking | UpdaterSnapshot::Downloading => {
+                        let lbl = if matches!(upd_snap, UpdaterSnapshot::Checking) {
+                            "BUSCANDO..."
+                        } else {
+                            "BAJANDO..."
+                        };
+                        ui.add_enabled_ui(false, |ui| {
+                            let _ = retro_pill(ui, p, false, lbl, vec2(upd_w, 30.0));
+                        });
                     }
-                    UpdateUiState::Error(e) => {
-                        ui.label(
-                            egui::RichText::new(format!("ERR: {e}"))
-                                .size(10.5)
-                                .color(p.led_red),
-                        );
+                    _ => {
+                        if retro_pill(ui, p, false, "UPDATES", vec2(upd_w, 30.0))
+                            .on_hover_text("Buscar nueva versión en GitHub Releases")
+                            .clicked()
+                        {
+                            do_check_updates = true;
+                        }
                     }
                 }
-            }
-            if let Some(info) = pending_install {
-                app.install_update(info);
-            }
+            });
         },
     );
+
+    if do_save {
+        app.save_config();
+    }
+    if do_check_updates {
+        app.check_for_updates();
+    }
+    if let Some(info) = pending_install {
+        app.install_update(info);
+    }
 }
 
 /// Ventana modal estilo vibranceGUI para elegir procesos `.exe` activos en el escritorio.
@@ -1028,7 +1123,10 @@ fn render_exe_picker_modal(app: &mut BalsUiApp, ctx: &egui::Context, p: &RetroPa
                                 badge_col,
                             );
 
-                            if resp.clicked() {
+                            if resp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
                                 clicked_exe = Some(item.exe_name.clone());
                             }
                             ui.add_space(3.0);

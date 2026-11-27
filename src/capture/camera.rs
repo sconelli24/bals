@@ -4,6 +4,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
@@ -104,6 +105,14 @@ pub fn list_cameras() -> Vec<CameraDeviceInfo> {
     list
 }
 
+struct SignalDone(crossbeam_channel::Sender<()>);
+
+impl Drop for SignalDone {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
 /// Sesión activa de captura de webcam en un hilo dedicado con buzón de último frame.
 ///
 /// - Solo se crea cuando `camera_enabled == true` y hay grabación activa (0% consumo y LED apagado en reposo).
@@ -116,10 +125,27 @@ pub struct CameraCapture {
     mirror: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CameraFrame>>>,
     recycle_buf: Arc<Mutex<Option<Vec<u8>>>>,
+    done_rx: crossbeam_channel::Receiver<()>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl CameraCapture {
+    /// Abre la cámara en un hilo separado para no bloquear el bucle principal CFR del motor.
+    pub fn spawn_async(
+        selected_symbolic_link: Option<String>,
+        mirror: bool,
+        preferred_preset: Option<CameraPreset>,
+    ) -> crossbeam_channel::Receiver<Result<Self>> {
+        let (tx, rx) = crossbeam_channel::bounded::<Result<Self>>(1);
+        let _ = thread::Builder::new()
+            .name("bals-webcam-init".to_string())
+            .spawn(move || {
+                let res = Self::start(selected_symbolic_link.as_deref(), mirror, preferred_preset);
+                let _ = tx.send(res);
+            });
+        rx
+    }
+
     /// Inicia la captura de la cámara elegida (`symbolic_link`) o la primera disponible si es `None`,
     /// usando `preferred_preset` (resolución + FPS) si se especificó.
     pub fn start(
@@ -163,10 +189,12 @@ impl CameraCapture {
 
         // Canal one-shot para confirmar si la cámara abrió correctamente (o está en uso por otra app).
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<()>>(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
 
         let worker = thread::Builder::new()
             .name("bals-webcam".to_string())
             .spawn(move || {
+                let _done_guard = SignalDone(done_tx);
                 let ro_ok = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
                 if let Err(err) = unsafe { MFStartup(MF_VERSION, 0) } {
                     let _ = init_tx.send(Err(anyhow::anyhow!("MFStartup (webcam) falló: {err}")));
@@ -199,7 +227,7 @@ impl CameraCapture {
             })
             .context("No se pudo iniciar el hilo bals-webcam")?;
 
-        match init_rx.recv() {
+        match init_rx.recv_timeout(Duration::from_secs(4)) {
             Ok(Ok(())) => {
                 info!(
                     camera = %target.friendly_name,
@@ -214,15 +242,21 @@ impl CameraCapture {
                     mirror: mirror_flag,
                     latest_frame,
                     recycle_buf,
+                    done_rx,
                     worker: Some(worker),
                 })
             }
             Ok(Err(err)) => {
                 closed.store(true, Ordering::SeqCst);
+                let _ = done_rx.recv_timeout(Duration::from_millis(600));
                 let _ = worker.join();
                 Err(err)
             }
-            Err(_) => {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                closed.store(true, Ordering::SeqCst);
+                bail!("Tiempo de espera agotado al abrir la cámara '{}'", target.friendly_name)
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 closed.store(true, Ordering::SeqCst);
                 let _ = worker.join();
                 bail!("El hilo de captura de cámara terminó inesperadamente al iniciar")
@@ -261,8 +295,18 @@ impl CameraCapture {
             if let Ok(mut slot) = self.recycle_buf.lock() {
                 *slot = None;
             }
+            // Esperar brevemente a que el hilo cierre su propio IMFSourceReader/IMFMediaSource
+            // sin llamar `source.Shutdown()` cross-thread (evita deadlocks dentro de mfreadwrite.dll).
+            let exited = self.done_rx.recv_timeout(Duration::from_millis(600)).is_ok();
             if let Some(handle) = self.worker.take() {
-                let _ = handle.join();
+                if exited {
+                    let _ = handle.join();
+                } else {
+                    debug!(
+                        camera = %self.device_name,
+                        "Hilo de webcam tardó en responder; continuando sin bloquear el motor"
+                    );
+                }
             }
             debug!(camera = %self.device_name, "Captura de cámara detenida (LED apagado)");
         }
@@ -287,7 +331,19 @@ fn camera_worker_loop(
     latest_frame: Arc<Mutex<Option<CameraFrame>>>,
     recycle_buf: Arc<Mutex<Option<Vec<u8>>>>,
 ) {
-    let setup = open_camera_reader(target_link, target_name, preferred_preset);
+    let setup = match open_camera_reader(target_link, target_name, preferred_preset) {
+        Ok(ok) => Ok(ok),
+        Err(first_err) if !closed.load(Ordering::Relaxed) => {
+            // Si la sesión anterior acaba de cerrar la cámara hace pocos milisegundos, reintentar una vez.
+            thread::sleep(Duration::from_millis(250));
+            if closed.load(Ordering::Relaxed) {
+                Err(first_err)
+            } else {
+                open_camera_reader(target_link, target_name, preferred_preset)
+            }
+        }
+        Err(err) => Err(err),
+    };
     let (source, reader, mut width, mut height, mut stride) = match setup {
         Ok(ok) => {
             let _ = init_tx.send(Ok(()));
