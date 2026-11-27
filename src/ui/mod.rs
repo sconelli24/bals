@@ -1,14 +1,12 @@
 mod clips_view;
+mod player;
 mod settings_view;
 mod theme;
 mod widgets;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -27,9 +25,10 @@ use crate::hotkey::{self, HotkeyCaptureEvent, display_hotkey, parse_hotkey};
 use crate::ipc::{self, EngineTelemetrySnapshot, TelemetryState};
 use crate::startup;
 use crate::trimmer::{
-    ClipMetadata, PreviewFrame, PreviewSession, TrimStats, compress_mp4_balanced,
-    suggested_output_with_suffix, suggested_trim_output, trim_mp4_passthrough,
+    ClipMetadata, TrimStats, compress_mp4_balanced, suggested_output_with_suffix,
+    suggested_trim_output, trim_mp4_passthrough,
 };
+use crate::ui::player::ClipPlayer;
 use crate::ui::theme::{RetroPalette, apply_egui_theme};
 use crate::ui::widgets::{
     TrimDragHandle, draw_crt_monitor_shell, draw_crt_recess, draw_dual_vent_grille,
@@ -71,139 +70,10 @@ pub(crate) enum UpdateUiState {
     Error(String),
 }
 
-struct PreviewRequest {
-    request_id: u64,
-    path: PathBuf,
-    time_secs: f64,
-    need_metadata: bool,
-}
-
-struct PreviewResult {
-    request_id: u64,
-    path: PathBuf,
-    frame: Option<PreviewFrame>,
-    metadata: Option<ClipMetadata>,
-}
-
 struct UiInitData {
     detected_encoders: DetectedEncoders,
     cameras: Vec<CameraDeviceInfo>,
     clips: Vec<ClipEntry>,
-}
-
-/// Hilo único persistente de decodificación CRT para mantener fluido el scrubbing sin spawnear hilos.
-struct PreviewWorker {
-    pending: Arc<(Mutex<Option<PreviewRequest>>, Condvar)>,
-    stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl PreviewWorker {
-    fn start(
-        req_counter: Arc<AtomicU64>,
-        ready_slot: Arc<Mutex<Option<PreviewResult>>>,
-    ) -> Self {
-        let pending: Arc<(Mutex<Option<PreviewRequest>>, Condvar)> =
-            Arc::new((Mutex::new(None), Condvar::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let pending_bg = Arc::clone(&pending);
-        let stop_bg = Arc::clone(&stop);
-
-        let handle = std::thread::Builder::new()
-            .name("bals-crt-preview".to_string())
-            .spawn(move || {
-                let mut session = PreviewSession::new().ok();
-                loop {
-                    let req = {
-                        let (lock, cv) = &*pending_bg;
-                        let mut guard = lock.lock().unwrap();
-                        while guard.is_none() && !stop_bg.load(Ordering::Relaxed) {
-                            guard = cv.wait(guard).unwrap();
-                        }
-                        if stop_bg.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        guard.take()
-                    };
-
-                    let Some(req) = req else { continue };
-                    if req_counter.load(Ordering::Relaxed) != req.request_id {
-                        continue;
-                    }
-
-                    if session.is_none() {
-                        session = PreviewSession::new().ok();
-                    }
-                    let Some(sess) = session.as_mut() else {
-                        if let Ok(mut slot) = ready_slot.lock() {
-                            *slot = Some(PreviewResult {
-                                request_id: req.request_id,
-                                path: req.path,
-                                frame: None,
-                                metadata: None,
-                            });
-                        }
-                        continue;
-                    };
-
-                    let metadata = if req.need_metadata {
-                        sess.probe_metadata(&req.path).ok()
-                    } else {
-                        None
-                    };
-
-                    if req_counter.load(Ordering::Relaxed) != req.request_id {
-                        continue;
-                    }
-
-                    let seek_t = if req.need_metadata {
-                        metadata
-                            .map(|m| 0.2_f64.min(m.duration_secs * 0.5))
-                            .unwrap_or(req.time_secs)
-                    } else {
-                        req.time_secs
-                    };
-
-                    let frame = sess.extract_frame(&req.path, seek_t, 448, 252).ok();
-
-                    if req_counter.load(Ordering::Relaxed) == req.request_id {
-                        if let Ok(mut slot) = ready_slot.lock() {
-                            *slot = Some(PreviewResult {
-                                request_id: req.request_id,
-                                path: req.path,
-                                frame,
-                                metadata,
-                            });
-                        }
-                    }
-                }
-            })
-            .ok();
-
-        Self {
-            pending,
-            stop,
-            handle,
-        }
-    }
-
-    fn request(&self, req: PreviewRequest) {
-        let (lock, cv) = &*self.pending;
-        if let Ok(mut guard) = lock.lock() {
-            *guard = Some(req);
-            cv.notify_one();
-        }
-    }
-}
-
-impl Drop for PreviewWorker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        self.pending.1.notify_all();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
 }
 
 pub(crate) struct BalsUiApp {
@@ -259,13 +129,14 @@ pub(crate) struct BalsUiApp {
     pub confirm_delete: Option<PathBuf>,
     metadata_cache: HashMap<(PathBuf, SystemTime, u64), ClipMetadata>,
 
-    // Vista previa de frame CRT asíncrona con debounce sobre worker persistente
+    // Reproductor nativo CRT + vista previa asíncrona con debounce
     pub preview_texture: Option<egui::TextureHandle>,
     pub preview_time_secs: f64,
     pub preview_loading: bool,
-    preview_req_counter: Arc<AtomicU64>,
-    preview_ready: Arc<Mutex<Option<PreviewResult>>>,
-    preview_worker: PreviewWorker,
+    pub clip_player: ClipPlayer,
+    pub player_loop: bool,
+    pub player_muted: bool,
+    pub player_volume: f32,
     pending_preview_seek: Option<(f64, Instant)>,
 }
 
@@ -289,10 +160,9 @@ impl BalsUiApp {
             egui::TextureOptions::NEAREST,
         ));
 
-        let preview_req_counter = Arc::new(AtomicU64::new(0));
-        let preview_ready = Arc::new(Mutex::new(None));
-        let preview_worker =
-            PreviewWorker::start(Arc::clone(&preview_req_counter), Arc::clone(&preview_ready));
+        let player_volume = 0.85f32;
+        let player_muted = false;
+        let clip_player = ClipPlayer::start(player_volume, player_muted);
 
         // Escaneo inicial pesado (encoders MFT, webcams USB, carpeta de clips) en segundo plano
         // para que la ventana abra de forma instantánea (<30 ms) sin freezeo.
@@ -357,9 +227,10 @@ impl BalsUiApp {
             preview_texture: None,
             preview_time_secs: 0.0,
             preview_loading: false,
-            preview_req_counter,
-            preview_ready,
-            preview_worker,
+            clip_player,
+            player_loop: false,
+            player_muted,
+            player_volume,
             pending_preview_seek: None,
             cfg,
         }
@@ -506,11 +377,13 @@ impl BalsUiApp {
             .metadata_key_for(&path)
             .and_then(|key| self.metadata_cache.get(&key).copied());
 
-        self.selected_clip = Some(path);
+        self.clip_player.pause();
+        self.selected_clip = Some(path.clone());
         self.confirm_delete = None;
         self.preview_texture = None;
         self.preview_time_secs = 0.0;
         self.pending_preview_seek = None;
+        self.preview_loading = true;
         if let Ok(mut st) = self.trim_state.lock() {
             *st = TrimState::Idle;
         }
@@ -520,13 +393,16 @@ impl BalsUiApp {
             self.selected_duration = Some(meta.duration_secs);
             self.trim_start = 0.0;
             self.trim_end = meta.duration_secs;
-            self.dispatch_preview_request(0.2_f64.min(meta.duration_secs * 0.5), false);
+            self.sync_player_loop();
+            self.clip_player
+                .load_clip(path, 0.2_f64.min(meta.duration_secs * 0.5));
         } else {
             self.selected_metadata = None;
             self.selected_duration = None;
             self.trim_start = 0.0;
             self.trim_end = 10.0;
-            self.dispatch_preview_request(0.2, true);
+            self.sync_player_loop();
+            self.clip_player.load_clip(path, 0.2);
         }
     }
 
@@ -535,19 +411,42 @@ impl BalsUiApp {
         self.pending_preview_seek = Some((time_secs, Instant::now()));
     }
 
-    fn dispatch_preview_request(&mut self, time_secs: f64, need_metadata: bool) {
-        let Some(path) = self.selected_clip.clone() else {
+    pub fn seek_now(&mut self, time_secs: f64) {
+        self.preview_time_secs = time_secs;
+        self.pending_preview_seek = None;
+        self.clip_player.seek(time_secs);
+    }
+
+    pub fn step_player_secs(&mut self, delta_secs: f64) {
+        self.pending_preview_seek = None;
+        self.clip_player.step_secs(delta_secs);
+    }
+
+    pub fn sync_player_loop(&self) {
+        self.clip_player
+            .set_loop_range(self.player_loop, self.trim_start, self.trim_end);
+    }
+
+    pub fn mark_trim_in_at_playhead(&mut self) {
+        let Some(total) = self.selected_duration else {
             return;
         };
-        let req_id = self.preview_req_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        self.preview_loading = true;
-        self.preview_time_secs = time_secs;
-        self.preview_worker.request(PreviewRequest {
-            request_id: req_id,
-            path,
-            time_secs,
-            need_metadata,
-        });
+        let min_gap = 0.5_f64.min(total);
+        self.trim_start = self
+            .preview_time_secs
+            .clamp(0.0, (self.trim_end - min_gap).max(0.0));
+        self.sync_player_loop();
+    }
+
+    pub fn mark_trim_out_at_playhead(&mut self) {
+        let Some(total) = self.selected_duration else {
+            return;
+        };
+        let min_gap = 0.5_f64.min(total);
+        self.trim_end = self
+            .preview_time_secs
+            .clamp((self.trim_start + min_gap).min(total), total);
+        self.sync_player_loop();
     }
 
     pub fn save_config(&mut self) {
@@ -783,49 +682,61 @@ impl BalsUiApp {
             }
         }
 
-        // 2. Preview CRT debounced (90 ms tras arrastrar [IN]/[OUT]).
+        // 2. Preview CRT debounced (55 ms tras arrastrar [IN]/[OUT] o scrub).
         if let Some((seek_t, at)) = self.pending_preview_seek {
-            if at.elapsed() >= Duration::from_millis(90) {
+            if at.elapsed() >= Duration::from_millis(55) {
                 self.pending_preview_seek = None;
-                self.dispatch_preview_request(seek_t, false);
+                self.clip_player.seek(seek_t);
             } else {
-                ctx.request_repaint_after(Duration::from_millis(40));
+                ctx.request_repaint_after(Duration::from_millis(25));
             }
         }
 
-        // 3. Cargar textura y metadata si el worker terminó de decodificar el frame CRT.
-        if let Ok(mut slot) = self.preview_ready.lock() {
-            if let Some(res) = slot.take() {
-                if res.request_id == self.preview_req_counter.load(Ordering::Relaxed) {
-                    if let Some(meta) = res.metadata {
-                        if let Some(key) = self.metadata_key_for(&res.path) {
-                            self.metadata_cache.insert(key, meta);
-                        }
-                        if self.selected_clip.as_ref() == Some(&res.path) {
-                            self.selected_metadata = Some(meta);
-                            self.selected_duration = Some(meta.duration_secs);
-                            self.trim_start = 0.0;
-                            self.trim_end = meta.duration_secs;
-                        }
-                    }
-                    if let Some(frame) = res.frame {
-                        let img = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width as usize, frame.height as usize],
-                            &frame.rgba,
-                        );
-                        self.preview_texture = Some(ctx.load_texture(
-                            "bals_crt_preview",
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                        self.preview_time_secs = frame.actual_time_secs;
-                    }
-                    self.preview_loading = false;
+        // 3. Consumir metadata y frames del reproductor nativo CRT (reutilizando textura GPU).
+        if let Some((path, meta)) = self.clip_player.take_metadata() {
+            if let Some(key) = self.metadata_key_for(&path) {
+                self.metadata_cache.insert(key, meta);
+            }
+            if self.selected_clip.as_ref() == Some(&path) && self.selected_metadata.is_none() {
+                self.selected_metadata = Some(meta);
+                self.selected_duration = Some(meta.duration_secs);
+                self.trim_start = 0.0;
+                self.trim_end = meta.duration_secs;
+                self.sync_player_loop();
+            }
+        }
+
+        while let Some(frame) = self.clip_player.take_frame() {
+            if self.selected_clip.as_ref() == Some(&frame.clip_path) {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &frame.rgba,
+                );
+                let target_size = [frame.width as usize, frame.height as usize];
+                if let Some(tex) = self
+                    .preview_texture
+                    .as_mut()
+                    .filter(|t| t.size() == target_size)
+                {
+                    tex.set(img, egui::TextureOptions::LINEAR);
+                } else {
+                    self.preview_texture = Some(ctx.load_texture(
+                        "bals_crt_preview",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                if self.pending_preview_seek.is_none() {
+                    self.preview_time_secs = frame.time_secs;
                 }
             }
         }
+        self.preview_loading = self.clip_player.is_loading();
         if self.preview_loading {
-            ctx.request_repaint_after(Duration::from_millis(60));
+            ctx.request_repaint_after(Duration::from_millis(35));
+        }
+        if self.tab != Tab::Clips && self.clip_player.is_playing() {
+            self.clip_player.pause();
         }
 
         // 4. Estado del trimmer / compresor en segundo plano.
@@ -977,6 +888,47 @@ impl BalsUiApp {
             ipc::notify_toggle_record();
             self.set_banner("Estado de grabación alternado.", false);
         }
+
+        // Atajos rápidos del reproductor cuando estamos en la pestaña Clips & Deck.
+        if self.tab == Tab::Clips && !text_editing && self.selected_clip.is_some() {
+            let (space, key_i, key_o, key_l, key_m, left, right, shift) = ctx.input(|i| {
+                let no_mod = !i.modifiers.ctrl && !i.modifiers.alt;
+                (
+                    no_mod && i.key_pressed(egui::Key::Space),
+                    no_mod && !i.modifiers.shift && i.key_pressed(egui::Key::I),
+                    no_mod && !i.modifiers.shift && i.key_pressed(egui::Key::O),
+                    no_mod && !i.modifiers.shift && i.key_pressed(egui::Key::L),
+                    no_mod && !i.modifiers.shift && i.key_pressed(egui::Key::M),
+                    no_mod && i.key_pressed(egui::Key::ArrowLeft),
+                    no_mod && i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.shift,
+                )
+            });
+            if space {
+                self.clip_player.toggle_play();
+            }
+            if key_i {
+                self.mark_trim_in_at_playhead();
+            }
+            if key_o {
+                self.mark_trim_out_at_playhead();
+            }
+            if key_l {
+                self.player_loop = !self.player_loop;
+                self.sync_player_loop();
+            }
+            if key_m {
+                self.player_muted = !self.player_muted;
+                self.clip_player.set_muted(self.player_muted);
+            }
+            let step = if shift { 0.1 } else { 1.0 };
+            if left {
+                self.step_player_secs(-step);
+            }
+            if right {
+                self.step_player_secs(step);
+            }
+        }
     }
 }
 
@@ -994,8 +946,8 @@ pub fn run_gui() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Bals")
             .with_icon(Arc::new(icon))
-            .with_inner_size([1100.0, 745.0])
-            .with_min_inner_size([1040.0, 720.0]),
+            .with_inner_size([1160.0, 800.0])
+            .with_min_inner_size([1080.0, 760.0]),
         ..Default::default()
     };
 
@@ -1027,8 +979,14 @@ impl eframe::App for BalsUiApp {
         self.handle_keyboard_shortcuts(&ctx);
         let running_op = self.poll_background_states(&ctx);
 
-        // Refresco fluido para VU meters y pulso LED (~25 FPS activo, ~5 FPS en segundo plano).
-        let repaint_ms = if ctx.input(|i| i.focused) { 40 } else { 200 };
+        // Refresco fluido: ~60 FPS al reproducir clips, ~25 FPS activo, ~5 FPS en segundo plano.
+        let repaint_ms = if self.tab == Tab::Clips && self.clip_player.is_playing() {
+            16
+        } else if ctx.input(|i| i.focused) {
+            40
+        } else {
+            200
+        };
         ctx.request_repaint_after(Duration::from_millis(repaint_ms));
 
         let time_s = ctx.input(|i| i.time) as f32;
@@ -1048,7 +1006,7 @@ impl eframe::App for BalsUiApp {
                 draw_crt_monitor_shell(ui.painter(), full_rect, &p);
 
                 // Márgenes físicos del chasis alrededor del monitor CRT
-                let content_rect = full_rect.shrink2(vec2(22.0, 12.0));
+                let content_rect = full_rect.shrink2(vec2(26.0, 14.0));
                 let top_h = 46.0;
                 let top_gap = 6.0;
                 let bottom_gap = 9.0;
@@ -1194,7 +1152,7 @@ impl eframe::App for BalsUiApp {
                 // 2. TUBO DE VIDRIO CRT CENTRAL CON CAVIDAD BISELADA 3D Y SCANLINES
                 // -----------------------------------------------------------------
                 let glass_rect = draw_crt_recess(ui.painter(), crt_outer_rect, &p);
-                let screen_content_rect = glass_rect.shrink2(vec2(12.0, 9.0));
+                let screen_content_rect = glass_rect.shrink2(vec2(14.0, 10.0));
 
                 ui.scope_builder(egui::UiBuilder::new().max_rect(screen_content_rect), |ui| {
                     match self.tab {

@@ -4,8 +4,8 @@ use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKin
 
 use crate::ui::theme::RetroPalette;
 use crate::ui::widgets::{
-    SectionIcon, draw_dual_trim_timeline, draw_floppy_icon, draw_scanlines, retro_card,
-    retro_pill, retro_play_pill,
+    SectionIcon, TimelineDragAction, draw_dual_trim_timeline, draw_floppy_icon, draw_scanlines,
+    retro_card, retro_pill, retro_play_pill, retro_transport_icon_pill,
 };
 use crate::ui::{BalsUiApp, open_in_shell};
 
@@ -53,6 +53,7 @@ fn render_clips_archive(app: &mut BalsUiApp, ui: &mut egui::Ui, p: &RetroPalette
         "ARCHIVO DE CLIPS",
         Some(&badge),
         |ui| {
+        ui.set_min_height((ui.available_height() - 4.0).max(160.0));
         // Controles rápidos: filtro + recargar + abrir carpeta
         ui.horizontal(|ui| {
             let filter_w = (ui.available_width() - 144.0).max(80.0);
@@ -242,8 +243,11 @@ fn render_crt_deck(
         "MONITOR CRT & RECORTADOR",
         meta_badge.as_deref(),
         |ui| {
+            let card_body_h = (ui.available_height() - 4.0).max(320.0);
+            ui.set_min_height(card_body_h);
+
             let Some(sel_path) = app.selected_clip.clone() else {
-                ui.add_space(40.0);
+                ui.add_space((card_body_h * 0.42).max(40.0));
                 ui.vertical_centered(|ui| {
                     ui.label(
                         egui::RichText::new("[ NO SIGNAL ]\nSelecciona un clip del archivo.")
@@ -254,9 +258,24 @@ fn render_crt_deck(
                 return;
             };
 
-            // 1. Monitor CRT 16:9 con vista previa real del frame decodificado
+            // 1. Monitor CRT expandido al alto disponible del deck
+            let gap = ui.spacing().item_spacing.y;
+            let controls_h = if app.selected_duration.is_some() {
+                // add_space(5) + transport(24) + add_space(4) + timeline(44)
+                // + fine_adjust(20) + add_space(8) + actions_row1(30)
+                // + add_space(5) + compress_btn(27) + 5 item gaps + 2px margin
+                169.0 + gap * 5.0
+            } else {
+                // add_space(5) + status_label(18) + add_space(8)
+                // + actions_row1(30) + add_space(5) + compress_btn(27) + 3 item gaps + 2px margin
+                95.0 + gap * 3.0
+            } + if running_op.is_some() {
+                17.0 + gap
+            } else {
+                0.0
+            };
             let mon_w = ui.available_width();
-            let mon_h = (mon_w * 9.0 / 16.0).clamp(155.0, 230.0);
+            let mon_h = (card_body_h - controls_h).max(180.0);
             let (mon_rect, mon_resp) =
                 ui.allocate_exact_size(vec2(mon_w, mon_h), Sense::click());
             let painter = ui.painter();
@@ -285,7 +304,7 @@ fn render_crt_deck(
                 );
             } else {
                 let msg = if app.preview_loading {
-                    "DECODIFICANDO FRAME CRT..."
+                    "CARGANDO CLIP EN MONITOR CRT..."
                 } else {
                     "VISTA PREVIA NO DISPONIBLE"
                 };
@@ -302,14 +321,26 @@ fn render_crt_deck(
                 draw_scanlines(painter, screen_rect, p.crt_scanline);
             }
 
-            // Overlays estilo VCR (esquina superior izquierda = timecode, derecha = nombre/resolución)
+            // Overlays estilo VCR (arriba izq = timecode + estado, arriba der = nombre)
+            let is_playing = app.clip_player.is_playing();
             let total_dur = app.selected_duration.unwrap_or(0.0);
+            let state_tag = if is_playing {
+                if app.player_loop { "LOOP" } else { "PLAY" }
+            } else {
+                "PAUSA"
+            };
             let tc_text = format!(
-                "{} / {}",
+                "{state_tag} · {} / {}",
                 format_timecode(app.preview_time_secs),
                 format_timecode(total_dur)
             );
-            draw_vcr_badge(painter, pos2(screen_rect.left() + 8.0, screen_rect.top() + 8.0), &tc_text, p, false);
+            draw_vcr_badge(
+                painter,
+                pos2(screen_rect.left() + 8.0, screen_rect.top() + 8.0),
+                &tc_text,
+                p,
+                false,
+            );
 
             let fname = sel_path
                 .file_name()
@@ -323,15 +354,101 @@ fn render_crt_deck(
                 true,
             );
 
+            let mon_resp = mon_resp
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Clic: Play / Pausa (Espacio) · Doble clic: abrir en reproductor externo");
             if mon_resp.double_clicked() {
+                app.clip_player.pause();
                 open_in_shell(&sel_path);
+            } else if mon_resp.clicked() {
+                app.clip_player.toggle_play();
             }
 
-            ui.add_space(6.0);
+            ui.add_space(5.0);
 
-            // 2. Línea de tiempo dual interactiva [IN] / [OUT]
+            // 1b. Barra compacta del reproductor nativo (Play/Pausa, paso rápido, Marcar IN/OUT, Loop, Volumen)
+            if app.selected_duration.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().slider_width = 64.0;
+
+                    if retro_transport_icon_pill(ui, p, is_playing, vec2(74.0, 24.0))
+                        .on_hover_text("Reproducir o pausar clip (Espacio)")
+                        .clicked()
+                    {
+                        app.clip_player.toggle_play();
+                    }
+
+                    if retro_pill(ui, p, false, "-1s", vec2(32.0, 24.0))
+                        .on_hover_text("Retroceder 1 segundo (Flecha izquierda · Shift: 0.1s)")
+                        .clicked()
+                    {
+                        app.step_player_secs(-1.0);
+                    }
+                    if retro_pill(ui, p, false, "+1s", vec2(32.0, 24.0))
+                        .on_hover_text("Avanzar 1 segundo (Flecha derecha · Shift: 0.1s)")
+                        .clicked()
+                    {
+                        app.step_player_secs(1.0);
+                    }
+
+                    ui.add_space(2.0);
+                    if retro_pill(ui, p, false, "MARCAR IN", vec2(76.0, 24.0))
+                        .on_hover_text("Fijar inicio del recorte [IN] en el frame actual (Tecla I)")
+                        .clicked()
+                    {
+                        app.mark_trim_in_at_playhead();
+                    }
+                    if retro_pill(ui, p, false, "MARCAR OUT", vec2(82.0, 24.0))
+                        .on_hover_text("Fijar fin del recorte [OUT] en el frame actual (Tecla O)")
+                        .clicked()
+                    {
+                        app.mark_trim_out_at_playhead();
+                    }
+
+                    ui.add_space(2.0);
+                    if retro_pill(ui, p, app.player_loop, "LOOP", vec2(46.0, 24.0))
+                        .on_hover_text("Reproducir en bucle solo el tramo [IN - OUT] (Tecla L)")
+                        .clicked()
+                    {
+                        app.player_loop = !app.player_loop;
+                        app.sync_player_loop();
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let has_audio = app.clip_player.has_audio();
+                        ui.add_enabled_ui(has_audio, |ui| {
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut app.player_volume, 0.0..=1.0)
+                                        .show_value(false),
+                                )
+                                .on_hover_text(format!(
+                                    "Volumen del reproductor: {:.0}%",
+                                    app.player_volume * 100.0
+                                ))
+                                .changed()
+                            {
+                                app.clip_player.set_volume(app.player_volume);
+                            }
+                            let mute_lbl = if app.player_muted { "MUTE" } else { "VOL" };
+                            if retro_pill(ui, p, !app.player_muted && has_audio, mute_lbl, vec2(44.0, 24.0))
+                                .on_hover_text("Silenciar / activar audio del clip (Tecla M)")
+                                .clicked()
+                            {
+                                app.player_muted = !app.player_muted;
+                                app.clip_player.set_muted(app.player_muted);
+                            }
+                        });
+                    });
+                });
+
+                ui.add_space(4.0);
+            }
+
+            // 2. Línea de tiempo dual interactiva [IN] / [OUT] + cabezal clickeable
             if let Some(total) = app.selected_duration {
-                if let Some(seek_t) = draw_dual_trim_timeline(
+                if let Some(action) = draw_dual_trim_timeline(
                     ui,
                     p,
                     total,
@@ -340,7 +457,15 @@ fn render_crt_deck(
                     &mut app.trim_end,
                     &mut app.trim_drag_handle,
                 ) {
-                    app.schedule_preview_seek(seek_t);
+                    match action {
+                        TimelineDragAction::TrimSeek(seek_t) => {
+                            app.sync_player_loop();
+                            app.schedule_preview_seek(seek_t);
+                        }
+                        TimelineDragAction::PlayheadSeek(seek_t) => {
+                            app.schedule_preview_seek(seek_t);
+                        }
+                    }
                 }
 
                 // Controles de ajuste fino (-0.5s / +0.5s) y resumen de duración
@@ -352,11 +477,13 @@ fn render_crt_deck(
                     );
                     if retro_pill(ui, p, false, "-.5", vec2(32.0, 20.0)).clicked() {
                         app.trim_start = (app.trim_start - 0.5).max(0.0);
-                        app.schedule_preview_seek(app.trim_start);
+                        app.sync_player_loop();
+                        app.seek_now(app.trim_start);
                     }
                     if retro_pill(ui, p, false, "+.5", vec2(32.0, 20.0)).clicked() {
                         app.trim_start = (app.trim_start + 0.5).min((app.trim_end - 0.5).max(0.0));
-                        app.schedule_preview_seek(app.trim_start);
+                        app.sync_player_loop();
+                        app.seek_now(app.trim_start);
                     }
 
                     ui.add_space(6.0);
@@ -367,11 +494,13 @@ fn render_crt_deck(
                     );
                     if retro_pill(ui, p, false, "-.5", vec2(32.0, 20.0)).clicked() {
                         app.trim_end = (app.trim_end - 0.5).max((app.trim_start + 0.5).min(total));
-                        app.schedule_preview_seek(app.trim_end);
+                        app.sync_player_loop();
+                        app.seek_now(app.trim_end);
                     }
                     if retro_pill(ui, p, false, "+.5", vec2(32.0, 20.0)).clicked() {
                         app.trim_end = (app.trim_end + 0.5).min(total);
-                        app.schedule_preview_seek(app.trim_end);
+                        app.sync_player_loop();
+                        app.seek_now(app.trim_end);
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -402,19 +531,20 @@ fn render_crt_deck(
 
             ui.add_space(8.0);
 
-            // 3. Botonera física Deck (Ver, Recorte Passthrough, Copiar Ruta, Borrar, Comprimir)
+            // 3. Botonera física Deck (Abrir externo, Recorte Passthrough, Copiar Ruta, Borrar, Comprimir)
             let trim_in_progress = running_op.is_some();
             ui.add_enabled_ui(!trim_in_progress, |ui| {
                 let row_w = ui.available_width();
                 ui.horizontal(|ui| {
-                    if retro_play_pill(ui, p, "VER", vec2(66.0, 30.0))
-                        .on_hover_text("Abrir en el reproductor de video de Windows")
+                    if retro_play_pill(ui, p, "ABRIR EXT", vec2(96.0, 30.0))
+                        .on_hover_text("Abrir en tu reproductor externo de video (ej. mpv)")
                         .clicked()
                     {
+                        app.clip_player.pause();
                         open_in_shell(&sel_path);
                     }
 
-                    let trim_w = (row_w - 266.0).max(150.0);
+                    let trim_w = (row_w - 296.0).max(150.0);
                     let trim_lbl = running_op.unwrap_or("RECORTAR SIN PÉRDIDA");
                     if retro_pill(ui, p, true, trim_lbl, vec2(trim_w, 30.0))
                         .on_hover_text("Corte instantáneo MP4 passthrough sin recodificar")

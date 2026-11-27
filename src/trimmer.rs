@@ -49,6 +49,7 @@ pub struct ClipMetadata {
 }
 
 /// Frame decodificado en formato RGBA8 listo para renderizar en el Monitor CRT de la UI.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PreviewFrame {
     pub width: u32,
@@ -124,11 +125,13 @@ fn probe_metadata_inner(path: &Path) -> Result<ClipMetadata> {
 
 /// Sesión persistente de vista previa CRT que mantiene `IMFStartup` y el último `IMFSourceReader`
 /// abiertos para hacer *scrubbing* instantáneo al arrastrar `[IN]` / `[OUT]`.
+#[allow(dead_code)]
 pub struct PreviewSession {
     mf_started: bool,
     open_clip: Option<OpenPreviewReader>,
 }
 
+#[allow(dead_code)]
 struct OpenPreviewReader {
     path: PathBuf,
     max_w: u32,
@@ -140,6 +143,7 @@ struct OpenPreviewReader {
     default_stride: i32,
 }
 
+#[allow(dead_code)]
 impl PreviewSession {
     pub fn new() -> Result<Self> {
         unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup (PreviewSession) falló")?;

@@ -1,6 +1,6 @@
 [package]
 name = "bals"
-version = "0.5.12"
+version = "0.5.13"
 edition = "2024"
 description = "Bals — Lightweight Windows game clipper built in Rust with zero-copy GPU capture and hardware encoding"
 
