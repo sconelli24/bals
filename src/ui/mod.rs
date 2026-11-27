@@ -1,4 +1,5 @@
 mod clips_view;
+mod gl_nv12;
 mod player;
 mod settings_view;
 mod theme;
@@ -28,7 +29,8 @@ use crate::trimmer::{
     ClipMetadata, TrimStats, compress_mp4_balanced, suggested_output_with_suffix,
     suggested_trim_output, trim_mp4_passthrough,
 };
-use crate::ui::player::ClipPlayer;
+use crate::ui::gl_nv12::Nv12GlRenderer;
+use crate::ui::player::{ClipPlayer, FramePixels};
 use crate::ui::theme::{RetroPalette, apply_egui_theme};
 use crate::ui::widgets::{
     TrimDragHandle, draw_crt_monitor_shell, draw_crt_recess, draw_dual_vent_grille,
@@ -130,10 +132,12 @@ pub(crate) struct BalsUiApp {
     metadata_cache: HashMap<(PathBuf, SystemTime, u64), ClipMetadata>,
 
     // Reproductor nativo CRT + vista previa asíncrona con debounce
+    pub nv12_renderer: Option<Nv12GlRenderer>,
     pub preview_texture: Option<egui::TextureHandle>,
     pub preview_time_secs: f64,
     pub preview_loading: bool,
     pub clip_player: ClipPlayer,
+    pub player_clip_released: bool,
     pub player_loop: bool,
     pub player_muted: bool,
     pub player_volume: f32,
@@ -141,7 +145,7 @@ pub(crate) struct BalsUiApp {
 }
 
 impl BalsUiApp {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(ctx: &egui::Context, gl: Option<&eframe::glow::Context>) -> Self {
         let cfg = AppConfig::load_or_create();
         let saved_cfg = cfg.clone();
         let last_config_stamp = read_config_stamp();
@@ -160,9 +164,15 @@ impl BalsUiApp {
             egui::TextureOptions::NEAREST,
         ));
 
+        let nv12_renderer = gl.and_then(Nv12GlRenderer::new);
         let player_volume = 0.85f32;
         let player_muted = false;
-        let clip_player = ClipPlayer::start(player_volume, player_muted);
+        let clip_player = ClipPlayer::start(
+            ctx.clone(),
+            player_volume,
+            player_muted,
+            nv12_renderer.is_some(),
+        );
 
         // Escaneo inicial pesado (encoders MFT, webcams USB, carpeta de clips) en segundo plano
         // para que la ventana abra de forma instantánea (<30 ms) sin freezeo.
@@ -224,10 +234,12 @@ impl BalsUiApp {
             trim_state: Arc::new(Mutex::new(TrimState::Idle)),
             confirm_delete: None,
             metadata_cache: HashMap::new(),
+            nv12_renderer,
             preview_texture: None,
             preview_time_secs: 0.0,
             preview_loading: false,
             clip_player,
+            player_clip_released: false,
             player_loop: false,
             player_muted,
             player_volume,
@@ -380,10 +392,12 @@ impl BalsUiApp {
         self.clip_player.pause();
         self.selected_clip = Some(path.clone());
         self.confirm_delete = None;
+        if let Some(r) = &self.nv12_renderer {
+            r.clear(self.clip_player.buffer_pool());
+        }
         self.preview_texture = None;
         self.preview_time_secs = 0.0;
         self.pending_preview_seek = None;
-        self.preview_loading = true;
         if let Ok(mut st) = self.trim_state.lock() {
             *st = TrimState::Idle;
         }
@@ -394,15 +408,29 @@ impl BalsUiApp {
             self.trim_start = 0.0;
             self.trim_end = meta.duration_secs;
             self.sync_player_loop();
-            self.clip_player
-                .load_clip(path, 0.2_f64.min(meta.duration_secs * 0.5));
+            if self.tab == Tab::Clips {
+                self.player_clip_released = false;
+                self.preview_loading = true;
+                self.clip_player
+                    .load_clip(path, 0.2_f64.min(meta.duration_secs * 0.5));
+            } else {
+                self.player_clip_released = true;
+                self.preview_loading = false;
+            }
         } else {
             self.selected_metadata = None;
             self.selected_duration = None;
             self.trim_start = 0.0;
             self.trim_end = 10.0;
             self.sync_player_loop();
-            self.clip_player.load_clip(path, 0.2);
+            if self.tab == Tab::Clips {
+                self.player_clip_released = false;
+                self.preview_loading = true;
+                self.clip_player.load_clip(path, 0.2);
+            } else {
+                self.player_clip_released = true;
+                self.preview_loading = false;
+            }
         }
     }
 
@@ -692,7 +720,24 @@ impl BalsUiApp {
             }
         }
 
-        // 3. Consumir metadata y frames del reproductor nativo CRT (reutilizando textura GPU).
+        // 3. Liberar / recargar lector MF según pestaña activa y consumir frames del reproductor.
+        if self.tab != Tab::Clips {
+            if !self.player_clip_released {
+                self.clip_player.release_clip();
+                self.player_clip_released = true;
+            }
+        } else if self.player_clip_released {
+            if let Some(path) = self.selected_clip.clone() {
+                let dur = self.selected_duration.unwrap_or(10.0);
+                let resume_t = self.preview_time_secs.clamp(0.0, dur.max(0.0));
+                self.player_clip_released = false;
+                self.sync_player_loop();
+                self.clip_player.load_clip(path, resume_t);
+            } else {
+                self.player_clip_released = false;
+            }
+        }
+
         if let Some((path, meta)) = self.clip_player.take_metadata() {
             if let Some(key) = self.metadata_key_for(&path) {
                 self.metadata_cache.insert(key, meta);
@@ -708,35 +753,61 @@ impl BalsUiApp {
 
         while let Some(frame) = self.clip_player.take_frame() {
             if self.selected_clip.as_ref() == Some(&frame.clip_path) {
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
-                let target_size = [frame.width as usize, frame.height as usize];
-                if let Some(tex) = self
-                    .preview_texture
-                    .as_mut()
-                    .filter(|t| t.size() == target_size)
-                {
-                    tex.set(img, egui::TextureOptions::LINEAR);
-                } else {
-                    self.preview_texture = Some(ctx.load_texture(
-                        "bals_crt_preview",
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                match frame.pixels {
+                    FramePixels::Nv12 {
+                        data,
+                        is_bt709,
+                        full_range,
+                    } => {
+                        if let Some(r) = &self.nv12_renderer {
+                            r.set_frame(
+                                frame.width,
+                                frame.height,
+                                data,
+                                is_bt709,
+                                full_range,
+                                self.clip_player.buffer_pool(),
+                            );
+                            self.preview_texture = None;
+                        } else {
+                            self.clip_player.buffer_pool().recycle_nv12(data);
+                        }
+                    }
+                    FramePixels::Rgba(pixels) => {
+                        if let Some(r) = &self.nv12_renderer {
+                            r.clear(self.clip_player.buffer_pool());
+                        }
+                        let target_size = [frame.width as usize, frame.height as usize];
+                        let img = egui::ColorImage {
+                            size: target_size,
+                            source_size: vec2(frame.width as f32, frame.height as f32),
+                            pixels,
+                        };
+                        if let Some(tex) = self
+                            .preview_texture
+                            .as_mut()
+                            .filter(|t| t.size() == target_size)
+                        {
+                            tex.set(img, egui::TextureOptions::LINEAR);
+                        } else {
+                            self.preview_texture = Some(ctx.load_texture(
+                                "bals_crt_preview",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                    }
                 }
                 if self.pending_preview_seek.is_none() {
                     self.preview_time_secs = frame.time_secs;
                 }
+            } else {
+                self.clip_player.buffer_pool().recycle_pixels(frame.pixels);
             }
         }
         self.preview_loading = self.clip_player.is_loading();
         if self.preview_loading {
             ctx.request_repaint_after(Duration::from_millis(35));
-        }
-        if self.tab != Tab::Clips && self.clip_player.is_playing() {
-            self.clip_player.pause();
         }
 
         // 4. Estado del trimmer / compresor en segundo plano.
@@ -955,7 +1026,7 @@ pub fn run_gui() -> Result<()> {
         "Bals",
         options,
         Box::new(|cc| {
-            let app = BalsUiApp::new(&cc.egui_ctx);
+            let app = BalsUiApp::new(&cc.egui_ctx, cc.gl.as_deref());
             let p = RetroPalette::for_theme(app.cfg.ui_theme);
             apply_egui_theme(&cc.egui_ctx, &p);
             Ok(Box::new(app))
@@ -979,9 +1050,20 @@ impl eframe::App for BalsUiApp {
         self.handle_keyboard_shortcuts(&ctx);
         let running_op = self.poll_background_states(&ctx);
 
-        // Refresco fluido: ~60 FPS al reproducir clips, ~25 FPS activo, ~5 FPS en segundo plano.
-        let repaint_ms = if self.tab == Tab::Clips && self.clip_player.is_playing() {
-            16
+        // Refresco guiado por eventos: el reproductor despierta la UI al publicar cada frame.
+        let is_recording = self.daemon_running
+            && self
+                .telemetry
+                .as_ref()
+                .is_some_and(|t| t.state == TelemetryState::RecordingGame);
+        let repaint_ms = if self.tab == Tab::Clips {
+            if self.clip_player.is_playing() {
+                100
+            } else if is_recording {
+                80
+            } else {
+                250
+            }
         } else if ctx.input(|i| i.focused) {
             40
         } else {
@@ -1249,6 +1331,12 @@ impl eframe::App for BalsUiApp {
                     });
                 });
             });
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Some(renderer), Some(gl_ctx)) = (&self.nv12_renderer, gl) {
+            renderer.destroy(gl_ctx);
+        }
     }
 }
 

@@ -290,18 +290,28 @@ fn render_crt_deck(
             );
 
             let screen_rect = mon_rect.shrink(4.0);
-            if let Some(tex) = &app.preview_texture {
-                let tex_size = tex.size_vec2();
-                let aspect = (tex_size.x / tex_size.y.max(1.0)).max(0.1);
+            let video_size = app
+                .nv12_renderer
+                .as_ref()
+                .and_then(|r| r.frame_size())
+                .map(|(w, h)| vec2(w as f32, h as f32))
+                .or_else(|| app.preview_texture.as_ref().map(|t| t.size_vec2()));
+
+            if let Some(vid_sz) = video_size {
+                let aspect = (vid_sz.x / vid_sz.y.max(1.0)).max(0.1);
                 let fit_w = (screen_rect.height() * aspect).min(screen_rect.width());
                 let fit_h = fit_w / aspect;
                 let img_rect = Rect::from_center_size(screen_rect.center(), vec2(fit_w, fit_h));
-                painter.image(
-                    tex.id(),
-                    img_rect,
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                if let Some(r) = app.nv12_renderer.as_ref().filter(|r| r.frame_size().is_some()) {
+                    painter.add(r.paint_callback(img_rect, app.clip_player.buffer_pool().clone()));
+                } else if let Some(tex) = &app.preview_texture {
+                    painter.image(
+                        tex.id(),
+                        img_rect,
+                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
             } else {
                 let msg = if app.preview_loading {
                     "CARGANDO CLIP EN MONITOR CRT..."
@@ -321,7 +331,7 @@ fn render_crt_deck(
                 draw_scanlines(painter, screen_rect, p.crt_scanline);
             }
 
-            // Overlays estilo VCR (arriba izq = timecode + estado, arriba der = nombre)
+            // Overlays estilo VCR (arriba izq = timecode + estado + backend, arriba der = nombre)
             let is_playing = app.clip_player.is_playing();
             let total_dur = app.selected_duration.unwrap_or(0.0);
             let state_tag = if is_playing {
@@ -329,8 +339,14 @@ fn render_crt_deck(
             } else {
                 "PAUSA"
             };
+            let pipe_tag = match (app.clip_player.is_hw_accelerated(), app.clip_player.is_nv12()) {
+                (true, true) => "GPU NV12",
+                (true, false) => "GPU RGB",
+                (false, true) => "CPU NV12",
+                (false, false) => "CPU RGB",
+            };
             let tc_text = format!(
-                "{state_tag} · {} / {}",
+                "{state_tag} · {} / {} · {pipe_tag}",
                 format_timecode(app.preview_time_secs),
                 format_timecode(total_dur)
             );
@@ -597,6 +613,12 @@ fn render_crt_deck(
                         .clicked()
                     {
                         if confirming {
+                            app.clip_player.release_clip_sync();
+                            app.player_clip_released = true;
+                            if let Some(r) = &app.nv12_renderer {
+                                r.clear(app.clip_player.buffer_pool());
+                            }
+                            app.preview_texture = None;
                             if std::fs::remove_file(&sel_path).is_ok() {
                                 app.confirm_delete = None;
                                 app.set_banner("Clip eliminado permanentemente.", false);
